@@ -82,8 +82,10 @@ static bool          g_is_live = false;
 
 static FxState fx_state[FX_CONTROL_NUM_EFFECTS];
 
-// Tempo, in BPM x100 (e.g. 12345 == 123.45 BPM). 0 until the first Set BPM.
-static uint16_t bpm_x100 = 0;
+// Tempo, in BPM x100 (e.g. 12345 == 123.45 BPM). Defaults to 120.00 BPM
+// (12000) at boot until a Set BPM command changes it.
+#define BPM_X100_DEFAULT  12000u   // 120.00 BPM
+static uint16_t bpm_x100 = BPM_X100_DEFAULT;
 
 // ---------------------------------------------------------------------------
 // RX ring (single-producer ISR, single-consumer poll)
@@ -269,7 +271,7 @@ static void parse_ring(void) {
 
 void fx_control_init(void) {
     memset(fx_state, 0, sizeof(fx_state));
-    bpm_x100 = 0;
+    bpm_x100 = BPM_X100_DEFAULT;
     reset_parser();
     rx_head = 0;
     rx_tail = 0;
