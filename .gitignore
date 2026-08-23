@@ -1,0 +1,35 @@
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+.DS_Store
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+firmware/build/*
+firmware/build-rp2350/*
+firmware/build-rp2040/*
+firmware/build_release/*
+firmware/eclipse_build/*
+/pico-sdk
+/build
+.vscode
+
+# Python bytecode cache (from tools/)
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore all markdown files except key docs
+*.md
+!README.md
+!Documentation/current_architecture.md
+!Documentation/Roadmap.md
+!Documentation/commands.md
+!Documentation/Features/*.md
+!tools/dspi_test/test_harness.md
+!tools/dspi_test/test_failures_diag.md

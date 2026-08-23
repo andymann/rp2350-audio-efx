@@ -1,0 +1,1814 @@
+/*
+ * USB Audio Implementation for DSPi
+ * UAC1 Audio Streaming with DSP Pipeline
+ *
+ * Phase 1: migrated from pico-extras usb_device → TinyUSB.  TinyUSB's built-in
+ * audio class driver is UAC2-only (audio_device.c:1576 rejects bInterfaceProtocol
+ * != V2), so DSPi registers its own UAC1 class driver via usbd_app_driver_get_cb().
+ * The vendor control interface has been dropped temporarily and will return in
+ * Phase 2.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+
+#include "pico/stdlib.h"
+#include "pico/audio.h"
+#include "pico/audio_spdif.h"
+#include "pico/audio_i2s_multi.h"
+#include "hardware/sync.h"
+#include "pico/bootrom.h"
+#include "hardware/irq.h"
+#include "hardware/dma.h"
+#include "hardware/pio.h"
+#include "hardware/timer.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/vreg.h"
+
+#include "tusb.h"
+#include "device/usbd_pvt.h"
+#include "class/audio/audio.h"
+
+#include "usb_audio.h"
+#include "audio_pipeline.h"
+#include "adat_output.h"
+#include "usb_descriptors.h"
+#include "dsp_pipeline.h"
+#include "dcp_inline.h"
+#include "pdm_generator.h"
+#include "flash_storage.h"
+#include "loudness.h"
+#include "crossfeed.h"
+#include "leveller.h"
+#include "bulk_params.h"
+#include "notify.h"
+#include "usb_audio_ring.h"
+#include "usb_feedback_controller.h"
+#include "vendor_commands.h"
+#include "audio_input.h"
+#include "lg_sound_sync.h"
+#include "loopback.h"   // DSPI_LOOPBACK capture driver (self-guarded; empty otherwise)
+
+#include <stddef.h>  // offsetof
+
+// ----------------------------------------------------------------------------
+// GLOBALS
+// ----------------------------------------------------------------------------
+
+volatile AudioState audio_state = { .freq = 44100 };
+volatile bool bypass_master_eq = false;
+volatile SystemStatusPacket global_status = {0};
+
+volatile bool eq_update_pending = false;
+volatile EqParamPacket pending_packet;
+// Linkwitz Transform target Qp (Q*512); latched with pending_packet, consumed by the eq_update_pending handler.
+volatile uint16_t pending_eq_qp_x512 = 0;
+volatile bool rate_change_pending = false;
+volatile uint32_t pending_rate = 48000;
+volatile bool bulk_params_pending = false;
+
+// UAC1 endpoint state is retained while USB is a decorative, inactive source;
+// audio_state.freq remains the rate actually applied to the live pipeline.
+static volatile uint32_t usb_selected_rate = 44100u;
+
+uint32_t usb_audio_get_selected_rate(void) {
+    return usb_selected_rate;
+}
+
+// Record the host's endpoint rate unconditionally, but only retune the live
+// pipeline when USB currently owns it.  The main loop performs the retune.
+static void usb_audio_set_selected_rate(uint32_t rate) {
+    usb_selected_rate = rate;
+    if (active_input_source != INPUT_SOURCE_USB || rate == audio_state.freq) return;
+
+    pending_rate = rate;
+    __dmb();
+    rate_change_pending = true;
+}
+
+// Output type switching — deferred to main loop (needs heap allocation).
+// Per-slot bitmask supports back-to-back requests without dropping any.
+volatile uint8_t output_type_change_mask = 0;                   // Bit N = slot N has pending change
+volatile uint8_t pending_output_types[NUM_SPDIF_INSTANCES];     // New type per slot
+// Output data-pin reassignment (SPDIF/I2S slots) — deferred to main loop so the
+// change runs through a muted, synchronized pipeline reset (preserves alignment).
+volatile uint8_t output_pin_change_mask = 0;                    // Bit N = slot N has pending pin change
+// USB stream restart (alt 0 -> alt > 0) — deferred to main loop for safe pipeline re-lock
+volatile bool stream_restart_resync_pending = false;
+
+// Preset operations — deferred to main loop so that:
+//  1. Flash writes (preset_save/delete/dir_flush) don't run in USB IRQ context,
+//     avoiding a ~45ms interrupt blackout inside an ISR.
+//  2. preset_load can be bracketed with prepare_pipeline_reset() /
+//     complete_pipeline_reset() to drain stale consumer buffers and resync
+//     all outputs.  Without this, buffers containing audio processed with the
+//     OLD preset's parameters play out for ~24ms after the new preset is applied.
+//  3. Delay line contents from the old preset are zeroed, preventing stale audio
+//     from bleeding through when delay length changes.
+volatile bool preset_load_pending = false;
+volatile uint8_t pending_preset_load_slot = 0;
+volatile bool save_params_pending = false;   // Legacy REQ_SAVE_PARAMS (deferred)
+volatile bool preset_save_pending = false;
+volatile uint8_t pending_preset_save_slot = 0;
+volatile uint16_t preset_delete_mask = 0;  // Bitmask of slots pending delete
+volatile bool factory_reset_pending = false;
+
+// SPSC ring buffer: USB audio ISR pushes raw packets, main loop consumes
+// and runs the DSP pipeline.  Placed in RAM for flash-operation safety.
+static usb_audio_ring_t __not_in_flash("audio_ring") audio_ring;
+
+// USB packet arrival timestamp for gap detection.  File-scope (not function-
+// local) so it can be reset to 0 on stream lifecycle transitions in
+// as_set_alternate() and usb_audio_flush_ring().
+static volatile uint32_t audio_ring_last_push_us = 0;
+
+// Deferred fire-and-forget flash SET commands.
+// Separate pending flags per command type prevent cross-command clobbering.
+// Same-command back-to-back is last-writer-wins (correct for idempotent settings).
+// Known limitation: SET_NAME for different slots in rapid succession can lose
+// one update.  In practice, host apps serialize preset edits.
+volatile bool flash_set_name_pending = false;
+uint8_t flash_set_name_slot = 0;
+char    flash_set_name_buf[PRESET_NAME_LEN];
+
+volatile bool flash_set_startup_pending = false;
+uint8_t flash_set_startup_mode = 0;
+uint8_t flash_set_startup_slot = 0;
+
+// Deferred output_config_mode directory update + explicit IO-config save
+// (flash writes must happen on the main loop, not in the USB ISR).
+volatile bool flash_set_output_config_mode_pending = false;
+uint8_t flash_set_output_config_mode_val = 0;
+volatile bool flash_save_output_config_pending = false;
+
+// Deferred master_volume_mode directory update (flash write must happen on main loop)
+volatile bool flash_set_master_volume_mode_pending = false;
+uint8_t flash_set_master_volume_mode_val = 0;
+
+// Deferred DAC hardware-mute config update.  USB ISR copies the 16-byte
+// payload into flash_set_dac_hw_mute_val and sets the pending flag; main
+// loop drains, validates, persists to flash directory, and applies the
+// pin claims.  The blocking flash write (~45 ms) must run from main-loop
+// context to avoid stalling USB.
+#include "dac_hw_mute.h"  // DacHwMuteConfig
+volatile bool flash_set_dac_hw_mute_pending = false;
+DacHwMuteConfig flash_set_dac_hw_mute_val = {0};
+
+// Deferred DAC hardware-mute test pulse.  The test asserts mute for ~1 s
+// then releases, used to verify the pin number and polarity at install
+// time.  Synchronous (1 s busy-wait) so it must defer to main loop.
+volatile bool dac_hw_mute_test_pending = false;
+
+// Deferred REQ_SAVE_MASTER_VOLUME — captures current live master_volume_db
+// into the directory's independent field.  Value is read at dispatch time.
+volatile bool flash_save_master_volume_pending = false;
+
+// Deferred UART / I2C control-interface config (USB-only commands).  Main
+// loop validates, applies live (GPIO/IRQ work), and persists to the
+// directory; the status bytes back REQ_GET_CTRL_IFACE_STATUS.
+volatile bool ctrl_set_uart_pending = false;
+UartCtrlConfig ctrl_set_uart_val;
+volatile uint8_t ctrl_uart_last_status = PIN_CONFIG_SUCCESS;
+volatile bool ctrl_set_i2c_pending = false;
+I2cCtrlConfig ctrl_set_i2c_val;
+volatile uint8_t ctrl_i2c_last_status = PIN_CONFIG_SUCCESS;
+
+// Deferred SPDIF RX hot-swap. Set when the spdif_rx_pin live global is
+// updated (by vendor command, bulk params apply, or preset load) while
+// INPUT_SOURCE_SPDIF is active — main loop bridges the stop/start
+// because spdif_rx library teardown is too heavy for the USB ISR
+// context where some of those updates originate.
+volatile bool spdif_rx_pin_change_pending = false;
+
+// 4 KB aligned buffer shared between GET and SET bulk param transfers.
+uint8_t __attribute__((aligned(4))) bulk_param_buf[WIRE_BULK_BUF_SIZE];
+
+// Per-input-channel preamp gain.  Indexed by input channel (0=USB L, 1=USB R).
+// Arrays sized by NUM_INPUT_CHANNELS so adding future inputs (e.g. S/PDIF)
+// only requires changing that constant.
+volatile float global_preamp_db[NUM_INPUT_CHANNELS]      = {[0 ... NUM_INPUT_CHANNELS-1] = 0.0f};
+volatile int32_t global_preamp_mul[NUM_INPUT_CHANNELS]    = {[0 ... NUM_INPUT_CHANNELS-1] = 268435456};  // Unity = 1<<28 (Q28)
+volatile float global_preamp_linear[NUM_INPUT_CHANNELS]   = {[0 ... NUM_INPUT_CHANNELS-1] = 1.0f};
+
+// Master volume — device-side ceiling on all output.  Applied post-output-gain,
+// does NOT affect loudness compensation, leveller, or any other DSP stage.
+// Range: MASTER_VOL_MIN_DB (-127) to MASTER_VOL_MAX_DB (0), with
+// MASTER_VOL_MUTE_DB (-128) as sentinel for true silence.
+// Power-on defaults: -20 dB (MASTER_VOL_DEFAULT_DB).  linear = 10^(-20/20) = 0.1,
+// q15 = 0.1 × 32768 ≈ 3277.  These only matter for the tiny window between C
+// startup and preset_boot_load (which overwrites all three); kept consistent
+// with the dB field so nothing briefly mismatches.
+volatile float master_volume_db       = MASTER_VOL_DEFAULT_DB;
+volatile float master_volume_linear   = 0.1f;
+volatile int32_t master_volume_q15    = 3277;
+
+// Vendor-channel user mute.  See header for the semantic split between this
+// and audio_state.mute (UAC1 mute).  Default false at boot — the device should
+// power on audible; subsequent vendor SET writes drive it.  Not persisted.
+volatile bool user_mute = false;
+
+// ----------------------------------------------------------------------------
+// Notification (bulk IN) state.  The wire-level ring, coalescing, and shadow
+// mirror live in notify.c; this file only owns the USB transport (TX buffer,
+// drain/arm logic, xfer_cb wiring).
+// ----------------------------------------------------------------------------
+
+// Legacy flag retained for back-compat with vendor_commands.c's existing
+// bracket around REQ_SET_MASTER_VOLUME.  Under v2, the source tag
+// (notify_set_source) carries the origin, but we keep this symbol alive
+// so the existing dispatch code still links.  Reading it is now a no-op.
+volatile bool notify_master_vol_host_initiated = false;
+
+// Defined in the UAC1 CLASS DRIVER section below.
+static void usb_notify_drain(uint8_t rhport);
+
+// Per-channel gain and mute (legacy 3-channel interface for flash compatibility)
+volatile float channel_gain_db[3] = {0.0f, 0.0f, 0.0f};
+volatile int32_t channel_gain_mul[3] = {32768, 32768, 32768};  // Unity = 2^15
+volatile float channel_gain_linear[3] = {1.0f, 1.0f, 1.0f};
+volatile bool channel_mute[3] = {false, false, false};
+
+// Matrix Mixer State
+MatrixMixer matrix_mixer = {0};
+
+// Loudness compensation state
+volatile bool loudness_enabled = false;
+volatile float loudness_ref_spl = 87.0f;
+volatile float loudness_intensity_pct = 100.0f;
+volatile bool loudness_recompute_pending = false;
+volatile uint16_t loudness_output_mask = LOUDNESS_DEFAULT_OUTPUT_MASK;
+
+const LoudnessCoeffs *volatile current_loudness_coeffs = NULL;
+
+// See header for the rationale.  Default 0 (silent) matches vol_mul's
+// BSS-zero state at boot before audio_set_volume() runs; first
+// audio_set_volume() / apply_vol_index_to_audio() updates this in
+// lock-step with vol_mul, and from then on it is the single source of
+// truth for "what user-perceived volume is currently active".
+volatile uint8_t effective_vol_index = 0;
+
+// Crossfeed state
+volatile CrossfeedConfig crossfeed_config = {
+    .enabled = false,
+    .itd_enabled = true,
+    .preset = CROSSFEED_PRESET_DEFAULT,
+    .custom_fc = 700.0f,
+    .custom_feed_db = 4.5f,
+    .output_pair_mask = 0x01  // Default: pair 1 only (outputs 0/1)
+};
+volatile bool crossfeed_update_pending = false;
+
+// Volume Leveller state
+volatile LevellerConfig leveller_config = {
+    .enabled = LEVELLER_DEFAULT_ENABLED,
+    .amount = LEVELLER_DEFAULT_AMOUNT,
+    .speed = LEVELLER_DEFAULT_SPEED,
+    .max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB,
+    .lookahead = LEVELLER_DEFAULT_LOOKAHEAD,
+    .gate_threshold_db = LEVELLER_DEFAULT_GATE_DB,
+    .detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK,
+    .apply_mask = LEVELLER_DEFAULT_APPLY_MASK
+};
+volatile bool leveller_update_pending = false;
+volatile bool leveller_reset_pending = false;
+volatile bool leveller_bypassed = true;  // Fast bypass flag for audio callback
+
+// Per-channel user-configurable names
+char channel_names[NUM_CHANNELS][PRESET_NAME_LEN];
+
+void get_default_channel_name(int ch, uint8_t input_source,
+                              const uint8_t *output_types, char *buf) {
+    memset(buf, 0, PRESET_NAME_LEN);
+    if (ch < 0 || ch >= NUM_CHANNELS) return;
+
+    if (ch < NUM_INPUT_CHANNELS) {
+        // Input channel names follow each source's natural model:
+        //   USB   - discrete channels: "USB 1" .. "USB 8".  A USB stream's
+        //           channels are independent, not stereo pairs, so they are
+        //           numbered per channel with no L/R.
+        //   I2S   - stereo pairs: "I2S 1 L", "I2S 1 R", "I2S 2 L", ... (matches
+        //           the output naming style; I2S input can be 1..4 pairs).
+        //   SPDIF - a single stereo pair: "SPDIF L" / "SPDIF R".
+        //   ADAT  - 8 discrete channels: "ADAT 1" .. "ADAT 8" (like USB).
+        if (input_source == INPUT_SOURCE_I2S) {
+            snprintf(buf, PRESET_NAME_LEN, "I2S %d %c",
+                     ch / 2 + 1, (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source_is_spdif(input_source)) {
+            // Input 1 keeps the historical bare "SPDIF L/R"; the optional
+            // inputs are numbered so the host can tell them apart.
+            uint8_t idx = spdif_index_for_source(input_source);
+            if (idx == 0)
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %c", (ch % 2 == 0) ? 'L' : 'R');
+            else
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %u %c",
+                         (unsigned)(idx + 1), (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source == INPUT_SOURCE_ADAT) {
+            // ADAT lightpipe carries 8 discrete channels; number them like USB.
+            snprintf(buf, PRESET_NAME_LEN, "ADAT %d", ch + 1);
+        } else {  // USB (and any future per-channel source)
+            snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
+        }
+        return;
+    }
+
+    if (ch == NUM_CHANNELS - 1) {   // PDM sub (last output)
+        strncpy(buf, "PDM", PRESET_NAME_LEN - 1);
+        return;
+    }
+
+    int slot_idx = (ch - NUM_INPUT_CHANNELS) / 2;
+    int side     = (ch - NUM_INPUT_CHANNELS) % 2;
+    uint8_t type = (output_types && slot_idx < NUM_SPDIF_INSTANCES)
+                       ? output_types[slot_idx]
+                       : OUTPUT_TYPE_SPDIF;
+    const char *prefix = (type == OUTPUT_TYPE_I2S) ? "I2S" : "SPDIF";
+    snprintf(buf, PRESET_NAME_LEN, "%s %d %c",
+             prefix, slot_idx + 1, (side == 0) ? 'L' : 'R');
+}
+
+// ---------------------------------------------------------------------------
+// Preamp & Master Volume helpers
+// ---------------------------------------------------------------------------
+
+// Update a single input channel's preamp gain from a dB value.
+// Computes both float (RP2350) and Q28 (RP2040) representations so the
+// audio callback can read the correct format without conversion.
+void update_preamp(uint8_t ch, float db) {
+    if (!isfinite(db)) return;  // Reject NaN/Inf — would propagate through entire audio path
+    if (ch >= NUM_INPUT_CHANNELS) return;
+    global_preamp_db[ch] = db;
+    float linear = powf(10.0f, db / 20.0f);
+    global_preamp_mul[ch]    = (int32_t)(linear * (float)(1 << 28));
+    global_preamp_linear[ch] = linear;
+    uint16_t off = (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float));
+    notify_param_write(off, sizeof(float), &db);
+}
+
+// Update the device-side master volume from a dB value.
+// Clamps to [MASTER_VOL_MUTE_DB .. MASTER_VOL_MAX_DB].
+// MASTER_VOL_MUTE_DB (-128) is a sentinel meaning true silence (−∞ dB).
+void update_master_volume(float db) {
+    if (!isfinite(db)) return;  // Reject NaN/Inf — would zero-out or corrupt all output
+    if (db < MASTER_VOL_MUTE_DB) db = MASTER_VOL_MUTE_DB;
+    if (db > MASTER_VOL_MAX_DB)  db = MASTER_VOL_MAX_DB;
+    master_volume_db = db;
+    if (db <= MASTER_VOL_MUTE_DB) {
+        // Mute sentinel — true silence
+        master_volume_linear = 0.0f;
+        master_volume_q15    = 0;
+    } else {
+        float linear = powf(10.0f, db / 20.0f);
+        master_volume_linear = linear;
+        master_volume_q15    = (int32_t)(linear * 32768.0f);
+    }
+    // Emit both v1 (legacy 8-byte master-volume packet) and v2
+    // (PARAM_CHANGED at WireBulkParams.master_volume.master_volume_db) so
+    // existing v1 hosts keep working while new hosts see everything via v2.
+    usb_notify_master_volume(db);
+    notify_param_write(offsetof(WireBulkParams, master_volume.master_volume_db),
+                       sizeof(float),
+                       &db);
+}
+
+// v1 legacy emit path.  Pushes an 8-byte MASTER_VOLUME entry into the
+// notification ring.  Kept for back-compat; new hosts should consume v2
+// PARAM_CHANGED events instead.  Safe to call from any main-thread context.
+void usb_notify_master_volume(float db) {
+    notify_push_master_volume_v1(db);
+}
+
+// See header for the contract.  Implementation mirrors audio_set_volume()'s
+// arithmetic (CENTER_VOLUME_INDEX shift, clamp, 8-bit truncation to vol_index)
+// minus the "if (active_input_source != INPUT_SOURCE_USB) return" guard, so
+// vendor / hardware-control writes of user-perceived volume always reach
+// vol_mul + the loudness coefficient pointer — keeping equal-loudness
+// compensation aligned with the actual volume the listener hears regardless of
+// which input is currently routed.  When LG Sound Sync is locked on SPDIF, its
+// next ~20 ms poll will overwrite this; that's intentional ownership during
+// LG-driven playback.
+//
+// audio_state.volume is written in the same 8.8-fixed-point dB encoding UAC1
+// uses, so a subsequent UAC1 GET_CUR returns the same value (Windows compares
+// what it last read against what the device reports — keeping these consistent
+// avoids a needless re-write loop when both controllers coexist).
+//
+// Main-loop only — softfloat (powf, lrintf) is permitted here because no
+// DSP_TIME_CRITICAL caller exists; vendor handlers and bulk_params_apply()
+// invoke this exclusively from the main thread.
+void update_user_volume(float db) {
+    if (!isfinite(db)) return;  // Reject NaN/Inf — would propagate through entire audio path
+    if (db < -(float)CENTER_VOLUME_INDEX) db = -(float)CENTER_VOLUME_INDEX;
+    if (db > 0.0f) db = 0.0f;
+
+    int16_t v = (int16_t)lrintf(db * 256.0f);
+    audio_state.volume = v;
+
+    int32_t vol = (int32_t)v + (int32_t)CENTER_VOLUME_INDEX * 256;
+    if (vol < 0) vol = 0;
+    int32_t hi = ((int32_t)CENTER_VOLUME_INDEX + 1) * 256 - 1;
+    if (vol > hi) vol = hi;
+    apply_vol_index_to_audio((uint8_t)((uint32_t)vol >> 8u));
+
+    // Invalidate LG Sound Sync's apply cache.  Without this, if LG is locked
+    // on SPDIF and its TV-decoded vol_index happens to match what we just
+    // wrote, the next LG poll will coalesce-skip and leave our apply in
+    // place — silently breaking the documented "LG always wins during
+    // SPDIF" invariant.  Cheap (single int store inside the LG module).
+    lg_sound_sync_invalidate_apply_cache();
+
+    // Notify v2 hosts that audio_state.volume moved.  WireBulkParams field
+    // is float dB (matches GET_CUR convention), so re-derive the post-clamp
+    // value rather than re-reading audio_state.volume — avoids a roundtrip
+    // through 8.8 quantization that would always look like a "change" to
+    // hosts comparing bytes.
+    float notify_db = (float)v / 256.0f;
+    notify_param_write(offsetof(WireBulkParams, user_volume.user_volume_db),
+                       sizeof(float), &notify_db);
+}
+
+// Called once per main-loop iteration from main.c.  Also handles the initial
+// arm (first time after enumeration, when the EP is open but no xfer has
+// fired yet) since xfer_cb only re-arms after a completion.
+void usb_notify_tick(void) {
+    usb_notify_drain(0);
+}
+
+// Sync State
+volatile uint64_t total_samples_produced = 0;
+volatile uint64_t start_time_us = 0;
+volatile bool sync_started = false;
+static volatile uint64_t last_packet_time_us = 0;
+static volatile uint8_t usb_input_bit_depth = 16;
+// Active USB input channel count: 2 for the stereo alts (1/2), or 4/6/8 for the
+// RP2350-only multichannel alts (3/4/5).  Read by the audio pipeline to size the
+// per-input EQ + metering and the matrix, and to bypass the stereo master chain
+// in multichannel mode.  Always 2 on RP2040 (no multichannel alts advertised).
+volatile uint8_t usb_input_channels = 2;
+#define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
+
+// True while USB audio packets are actively arriving.  The in-band gap check
+// in process_audio_packet only fires on the NEXT packet, so a host that stops
+// streaming leaves sync_started latched; the test-signal pump needs a live
+// view to know when to take over pacing.
+bool usb_audio_stream_active(void) {
+    if (!sync_started) return false;
+    uint64_t last = last_packet_time_us;
+    return last > 0 && (time_us_64() - last) <= AUDIO_GAP_THRESHOLD_US;
+}
+
+// Consumer fill for instance 0 — used by watermark monitoring only
+// (no longer part of the active feedback path).
+volatile uint8_t spdif0_consumer_fill = 0;
+
+// Audio Pools (S/PDIF stereo pairs)
+struct audio_buffer_pool *producer_pool_1 = NULL;  // S/PDIF 1 (Out 1-2)
+struct audio_buffer_pool *producer_pool_2 = NULL;  // S/PDIF 2 (Out 3-4)
+#if PICO_RP2350
+struct audio_buffer_pool *producer_pool_3 = NULL;  // S/PDIF 3 (Out 5-6)
+struct audio_buffer_pool *producer_pool_4 = NULL;  // S/PDIF 4 (Out 7-8)
+#endif
+struct audio_format audio_format_48k = { .format = AUDIO_BUFFER_FORMAT_PCM_S32, .sample_freq = 48000, .channel_count = 2 };
+
+// Legacy aliases
+#define producer_pool producer_pool_1
+#define sub_producer_pool producer_pool_2
+
+// ----------------------------------------------------------------------------
+// VOLUME
+// ----------------------------------------------------------------------------
+static uint16_t db_to_vol[CENTER_VOLUME_INDEX + 1] = {
+    // Index 0 = silent (slider bottom), index 1 = -59 dB, ..., index 60 = 0 dB
+    0x0000, 0x0025, 0x0029, 0x002e, 0x0034, 0x003a, 0x0041, 0x0049,
+    0x0052, 0x005c, 0x0068, 0x0074, 0x0082, 0x0092, 0x00a4, 0x00b8,
+    0x00cf, 0x00e8, 0x0104, 0x0124, 0x0148, 0x0170, 0x019d, 0x01cf,
+    0x0207, 0x0247, 0x028e, 0x02de, 0x0337, 0x039c, 0x040c, 0x048b,
+    0x0519, 0x05b8, 0x066a, 0x0733, 0x0814, 0x0910, 0x0a2b, 0x0b68,
+    0x0ccd, 0x0e5d, 0x101d, 0x1215, 0x1449, 0x16c3, 0x198a, 0x1ca8,
+    0x2027, 0x2413, 0x287a, 0x2d6b, 0x32f5, 0x392d, 0x4027, 0x47fb,
+    0x50c3, 0x5a9e, 0x65ad, 0x7215, 0x8000
+};
+
+#define ENCODE_DB(x) ((int16_t)((x)*256))
+#define MIN_VOLUME           ENCODE_DB(-CENTER_VOLUME_INDEX)
+#define DEFAULT_VOLUME       ENCODE_DB(0)
+#define MAX_VOLUME           ENCODE_DB(0)
+#define VOLUME_RESOLUTION    ENCODE_DB(1)
+
+// Apply a vol_index to the live audio path (vol_mul + loudness coeffs).
+// See usb_audio.h for the contract.  Extracted from audio_set_volume() so
+// alternative volume owners (LG Sound Sync, future controllers) can drive
+// the same internal state — keeping loudness compensation aligned with
+// whatever ultimately sets vol_mul.
+void apply_vol_index_to_audio(uint8_t vol_index) {
+    // Defensive clamp: db_to_vol[] and loudness_active_table[] are sized
+    // exactly CENTER_VOLUME_INDEX+1.  A bad vol_index from a corrupt mapping
+    // would otherwise read out-of-bounds; the cost of one branch here is
+    // negligible vs. the consequences.
+    if (vol_index > CENTER_VOLUME_INDEX) vol_index = CENTER_VOLUME_INDEX;
+
+    audio_state.vol_mul = db_to_vol[vol_index];
+
+    // Track the active vol_index so the loudness re-enable / table-recompute
+    // paths can re-key against the *current* value rather than recomputing
+    // it from audio_state.volume — which is wrong when an alternative
+    // volume owner (e.g. LG Sound Sync on SPDIF input) is driving vol_mul.
+    // Written before the coeff swap so a future Core 1 reader of
+    // effective_vol_index never sees an index that's "ahead" of the
+    // coefficients it is paired with.
+    effective_vol_index = vol_index;
+
+    // Loudness compensation is keyed off the *raw* user-perceived volume.
+    // Anything that changes vol_mul must also re-point the coefficient
+    // table or the equal-loudness contour will compensate against a stale
+    // reference level.  Pointer swap is atomic on both Cortex-M0+ and M33;
+    // a worst-case stale read by the audio pipeline is one packet (~1 ms).
+    if (loudness_enabled && loudness_active_table) {
+        current_loudness_coeffs = loudness_active_table[vol_index];
+    }
+}
+
+void audio_set_volume(int16_t volume) {
+    // Always record the host's last-set value so GET_CUR round-trips correctly
+    // — Windows compares what it read back against what it last wrote.
+    audio_state.volume = volume;
+
+    // Host volume control is inert when USB isn't the DSP input source.  The
+    // SPDIF→USB transition in the input-source switch handler calls
+    // audio_set_volume(audio_state.volume) to thaw the cached value into the
+    // live gain path.  When SPDIF is selected, LG Sound Sync (if active) owns
+    // vol_mul instead — see lg_sound_sync.c.
+    if (active_input_source != INPUT_SOURCE_USB) return;
+
+    volume += CENTER_VOLUME_INDEX * 256;
+    if (volume < 0) volume = 0;
+    if (volume >= (CENTER_VOLUME_INDEX + 1) * 256) volume = (CENTER_VOLUME_INDEX + 1) * 256 - 1;
+    apply_vol_index_to_audio((uint8_t)(((uint16_t)volume) >> 8u));
+}
+
+// ----------------------------------------------------------------------------
+// USB-specific wrapper: byte decode + gap detection, then pipeline
+// (process_input_block is in audio_pipeline.c)
+// ----------------------------------------------------------------------------
+static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint16_t data_len) {
+    // USB format snapshot
+    const uint8_t bit_depth = usb_input_bit_depth;  // snapshot once — avoid double-read of volatile
+    const uint8_t channels  = usb_input_channels;   // 2 (stereo alts) or 4/6/8 (multichannel alts)
+    // Multichannel alts are always 16-bit; stereo alts are 16- or 24-bit.
+    uint32_t bytes_per_frame = (channels > NUM_STEREO_INPUTS)
+                                   ? (uint32_t)channels * 2
+                                   : (bit_depth == 24) ? 6 : 4;
+    uint32_t sample_count = data_len / bytes_per_frame;
+    // Clamp to the fixed decode-buffer depth.  The iso OUT EP is armed for
+    // AUDIO_EP_MAX_PKT (788 on RP2350 to fit 8-channel frames); a conformant
+    // host never sends more than ~1 ms of audio per frame (<=97 stereo / 49
+    // eight-channel samples), but a non-conformant host or USB anomaly could
+    // deliver a larger transfer.  Without this guard a 16-bit stereo packet of
+    // 788 B would decode 197 samples and overrun buf_l/buf_r[192].
+    if (sample_count > AUDIO_BUFFER_SAMPLES) sample_count = AUDIO_BUFFER_SAMPLES;
+
+    // USB-specific gap detection + sync tracking
+    // NOTE: USB packet gap detection has moved to _as_audio_packet() (ISR
+    // context) where it measures actual packet arrival timing rather than
+    // main-loop processing timing.  See audio_ring_last_push_us.
+    uint64_t now_us = time_us_64();
+    if (sync_started && last_packet_time_us > 0 &&
+        (now_us - last_packet_time_us) > AUDIO_GAP_THRESHOLD_US) {
+        sync_started = false;
+        total_samples_produced = 0;
+        pipeline_reset_cpu_metering();
+    }
+    last_packet_time_us = now_us;
+    if (!sync_started) {
+        start_time_us = now_us;
+        sync_started = true;
+    }
+    total_samples_produced += sample_count;
+
+    // PASS 1: USB byte decode → buf_l/buf_r + preamp
+#if PICO_RP2350
+    {
+        if (channels > NUM_STEREO_INPUTS) {
+            // Multichannel USB input (4/6/8 ch, 48 kHz / 16-bit).  Frame layout
+            // is c0,c1,...,c(N-1) interleaved (stride = channels); channels 0/1
+            // land in buf_l/buf_r (the shared stereo bus), channels 2..N-1 in
+            // buf_in_ext.  Per-channel preamp applied here; the stereo master
+            // chain is bypassed downstream (process_input_block multichannel).
+            const int16_t *in = (const int16_t *)data;
+            const float inv_32768 = 1.0f / 32768.0f;
+            float gain[NUM_INPUT_CHANNELS];
+            for (int c = 0; c < channels; c++)
+                gain[c] = inv_32768 * global_preamp_linear[c];
+            for (uint32_t i = 0; i < sample_count; i++) {
+                const int16_t *frame = &in[i * channels];
+                buf_l[i] = (float)frame[0] * gain[0];
+                buf_r[i] = (float)frame[1] * gain[1];
+                for (int c = NUM_STEREO_INPUTS; c < channels; c++)
+                    buf_in_ext[c - NUM_STEREO_INPUTS][i] =
+                        (float)frame[c] * gain[c];
+            }
+        } else if (bit_depth == 24) {
+            //     input 32 bit word to 24 bit output packing
+            //        in0     in1      in2
+            //     +-------+-------+-------+
+            //       (beware of l-endian)
+            //     +-----+-----+-----+-----+
+            //        l1    r1    l2    r2
+
+            const uint32_t *in = (const uint32_t *)data;
+            float *out_l = &buf_l[0], *out_r = &buf_r[0];
+            const float inv_8388608 = 1.0f / 8388608.0f;
+            const float gain_l = inv_8388608 * global_preamp_linear[0];
+            const float gain_r = inv_8388608 * global_preamp_linear[1];
+
+            //unpack 3 32bit words into 4 24 bit l,r,l,r samples
+            for (uint32_t i = 0; i < sample_count/2; i++) {
+                int32_t i0 = *in++;
+                int32_t i1 = *in++;
+                int32_t i2 = *in++;
+                int32_t temp;
+                float l1, l2, r1, r2;
+
+                __asm__ volatile (
+                    "sbfx %[TEMP], %[I0], #0, #24\n\t"  //sign extend i0[23:0] to 32 bits
+                    "vmov %[L1], %4\n\t"
+                    "vcvt.f32.s32 %[L1], %[L1]\n\t"     // l1 result
+
+                    "sxth %[TEMP], %[I1]\n\t"           // extract and sign extend halfword i1[15:0]
+                    "lsl %[TEMP], %[TEMP], #8\n\t"      // shift left 8 bits
+                    "asr %[I0], %[I0], #24\n\t"         // shift i0 right 24 bits
+                    "bfi %[TEMP], %[I0], #0, #8\n\t"    // insert i0[7:0] into temp[7:0]
+                    "vmov %[R1], %[TEMP]\n\t"
+                    "vcvt.f32.s32 %[R1], %[R1]\n\t"     // r1 result
+
+                    "asr %[TEMP], %[I1], #8\n\t"        // arithmetic shift right 8 bits i1
+                    "bfi %[TEMP], %[I2], #24, #8\n\t"   // copy 8 lsb of i2 into temp[31:24]
+                    "asr %[TEMP], %[TEMP], #8\n\t"      // arithmetic shift right temp left 8
+                    "vmov %[L2], %[TEMP]\n\t"
+                    "vcvt.f32.s32 %[L2], %[L2]\n\t"     // l2 result
+
+                    "asr %[TEMP], %[I2], #8\n\t"        // arithmetic shift right i2[31:8] by 8 into temp
+                    "vmov %[R2], %[TEMP]\n\t"
+                    "vcvt.f32.s32 %[R2], %[R2]\n\t"     // r2 result
+
+                    : [L1] "=w" (l1),
+                    [R1] "=w" (r1),
+                    [L2] "=w" (l2),
+                    [R2] "=w" (r2),
+                    [TEMP] "=&r" (temp)
+                    : [I0] "r" (i0),
+                    [I1] "r" (i1),
+                    [I2] "r" (i2)
+                );
+
+                *out_l++ = l1 * gain_l;
+                *out_l++ = l2 * gain_l;
+                *out_r++ = r1 * gain_r;
+                *out_r++ = r2 * gain_r;
+            }
+            //if sample count is not divisible by 2 pick up the remaining l,r sample
+            if(sample_count % 2) {
+                int32_t i0 = *in++;
+                int32_t i1 = *in++;
+                int32_t temp;
+                float l1, r1;
+
+                __asm__ volatile (
+                    "sbfx %[TEMP], %[I0], #0, #24\n\t"  //sign extend i0[23:0] to 32 bits
+                    "vmov %[L1], %[TEMP]\n\t"
+                    "vcvt.f32.s32 %[L1], %[L1]\n\t"     // l1 result
+
+                    "sxth %[TEMP], %[I1]\n\t"           // extract and sign extend halfword i1[15:0]
+                    "lsl %[TEMP], %[TEMP], #8\n\t"      // shift left 8 bits
+                    "asr %[I0], %[I0], #24\n\t"         // shift i0 right 24 bits
+                    "bfi %[TEMP], %[I0], #0, #8\n\t"    // insert i0[7:0] into temp[7:0]
+                    "vmov %[R1], %[TEMP]\n\t"
+                    "vcvt.f32.s32 %[R1], %[R1]\n\t"     // r1 result
+
+                    : [L1] "=w" (l1),
+                    [R1] "=w" (r1),
+                    [TEMP] "=&r" (temp)
+                    : [I0] "r" (i0),
+                    [I1] "r" (i1)
+                );
+                *out_l++ = l1 * gain_l;
+                *out_r++ = r1 * gain_r;
+            }
+        } else {
+            const int16_t *in = (const int16_t *)data;
+            const float inv_32768 = 1.0f / 32768.0f;
+            float gain_l = inv_32768 * global_preamp_linear[0];
+            float gain_r = inv_32768 * global_preamp_linear[1];
+            for (uint32_t i = 0; i < sample_count; i++) {
+                buf_l[i] = (float)in[i*2] * gain_l;
+                buf_r[i] = (float)in[i*2+1] * gain_r;
+            }
+        }
+    }
+#else
+    {
+        int32_t preamp_l = global_preamp_mul[0];
+        int32_t preamp_r = global_preamp_mul[1];
+        if (bit_depth == 24) {
+            const uint8_t *p = (const uint8_t *)data;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                // 24-bit -> Q28: left-justify to [31:8] then >>2 = net <<6
+                int32_t raw_left_32  = (int32_t)((uint32_t)p[2] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[0] << 8) >> 2;
+                int32_t raw_right_32 = (int32_t)((uint32_t)p[5] << 24 | (uint32_t)p[4] << 16 | (uint32_t)p[3] << 8) >> 2;
+                buf_l[i] = fast_mul_q28(raw_left_32, preamp_l);
+                buf_r[i] = fast_mul_q28(raw_right_32, preamp_r);
+                p += 6;
+            }
+        } else {
+            const int16_t *in = (const int16_t *)data;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                int32_t raw_left_32 = (int32_t)in[i*2] << 14;
+                int32_t raw_right_32 = (int32_t)in[i*2+1] << 14;
+                buf_l[i] = fast_mul_q28(raw_left_32, preamp_l);
+                buf_r[i] = fast_mul_q28(raw_right_32, preamp_r);
+            }
+        }
+    }
+#endif
+
+    process_input_block(sample_count);
+}
+
+// ----------------------------------------------------------------------------
+// USB AUDIO RING BUFFER — PUBLIC WRAPPERS
+// ----------------------------------------------------------------------------
+
+// Drain all pending packets from the ring, running the DSP pipeline for
+// each.  Called as the first operation in the main loop and before any
+// disruptive deferred operation (rate change, output type switch, etc.).
+DSP_TIME_CRITICAL
+void usb_audio_drain_ring(void) {
+    usb_audio_slot_t *slot;
+    while ((slot = usb_audio_ring_peek(&audio_ring)) != NULL) {
+        process_audio_packet(slot->data, slot->data_len);
+        usb_audio_ring_consume(&audio_ring);
+    }
+}
+
+// Discard all pending ring data and reset gap-detection timestamp.
+// Used on stream stop/start transitions to flush stale packets from a
+// previous stream.
+DSP_TIME_CRITICAL
+void usb_audio_flush_ring(void) {
+    usb_audio_ring_flush(&audio_ring);
+    audio_ring_last_push_us = 0;
+}
+
+// Ring overrun accessor (audio_ring is static)
+uint32_t usb_audio_ring_overrun_count(void) {
+    return audio_ring.overrun_count;
+}
+
+// Derive Core 1 mode from current output enable state.
+// (Moved from vendor_commands.c during the Phase 1 TinyUSB migration — still
+// needed by main.c and flash_storage.c for preset-load Core 1 transitions.)
+Core1Mode derive_core1_mode(void) {
+    if (matrix_mixer.outputs[NUM_OUTPUT_CHANNELS - 1].enabled)
+        return CORE1_MODE_PDM;
+    for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+        if (matrix_mixer.outputs[out].enabled)
+            return CORE1_MODE_EQ_WORKER;
+    }
+    return CORE1_MODE_IDLE;
+}
+
+// ----------------------------------------------------------------------------
+// UAC1 CLASS DRIVER (custom TinyUSB class driver, registered via
+// usbd_app_driver_get_cb). TinyUSB's built-in audio class driver is UAC2-only
+// (audio_device.c:1576), so we provide our own UAC1 implementation without
+// patching vendored SDK code.
+// ----------------------------------------------------------------------------
+
+// Endpoint buffers.  Must live in RAM; reused across every transfer.
+// Audio data OUT: sized for worst-case (24-bit 96 kHz + 1 jitter sample).
+// Feedback IN: 4 bytes (actual payload 3, DCD requires 4-byte iso alloc).
+static uint8_t __attribute__((aligned(4))) __not_in_flash("audio_scratch") ep_out_buf[AUDIO_EP_MAX_PKT];
+static uint8_t __attribute__((aligned(4))) __not_in_flash("audio_scratch") ep_fb_buf[4];
+
+// Control request scratch for SET_CUR data stage (1-3 bytes payload).
+static uint8_t uac1_ctrl_buf[8];
+
+// Class driver state (AC+AS audio function + vendor interface).
+static struct {
+    uint8_t ac_itf;
+    uint8_t as_itf;
+    uint8_t vendor_itf;      // 0xFF = not claimed
+    uint8_t cur_alt;         // Current AS alt setting (0, 1, or 2)
+    bool    ep_data_open;
+    bool    ep_fb_open;
+    bool    notify_ep_open;  // Interrupt IN EP 0x83 on the vendor interface
+    // Deferred SET_CUR context (captured at SETUP, applied at DATA)
+    uint8_t pending_cs;
+    uint8_t pending_recipient;
+    uint8_t pending_len;
+} uac1 = { .vendor_itf = 0xFF };
+
+// Stable TX buffer for the notification EP — DCD may DMA from it until
+// xfer_cb fires. Placed in RAM for flash-operation safety.
+static uint8_t __attribute__((aligned(4))) __not_in_flash("notify_buf") notify_buf[NOTIFY_EP_MAX_PKT];
+
+// usb_notify_drain is forward-declared near the other notification state at
+// the top of this file so update_master_volume() can reach it.
+
+extern usb_feedback_ctrl_t fb_ctrl;
+
+// Forward decls.
+static void uac1_driver_init(void);
+static bool uac1_driver_deinit(void);
+static void uac1_driver_reset(uint8_t rhport);
+static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len);
+static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
+static bool uac1_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
+static void uac1_driver_sof(uint8_t rhport, uint32_t frame_count);
+
+static const usbd_class_driver_t uac1_driver = {
+    .name            = "DSPi_UAC1",
+    .init            = uac1_driver_init,
+    .deinit          = uac1_driver_deinit,
+    .reset           = uac1_driver_reset,
+    .open            = uac1_driver_open,
+    .control_xfer_cb = uac1_driver_control_xfer_cb,
+    .xfer_cb         = uac1_driver_xfer_cb,
+    .sof             = uac1_driver_sof,
+};
+
+// TinyUSB looks up this weak symbol during tud_init(). Returning our driver
+// here makes TinyUSB dispatch all interface/endpoint events for our AC+AS
+// interfaces through our callbacks.
+usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
+#ifdef DSPI_LOOPBACK
+    // Debug build: register the loopback capture driver alongside the playback
+    // driver.  TinyUSB iterates the returned array, so both driver structs must
+    // be contiguous; loopback_uac1_driver is defined in another TU and is not a
+    // constant initializer, so the array is filled at call time (this runs once
+    // during tud_init() and the static storage outlives the device).
+    static usbd_class_driver_t drivers[2];
+    drivers[0] = uac1_driver;
+    drivers[1] = loopback_uac1_driver;
+    *driver_count = 2;
+    return drivers;
+#else
+    *driver_count = 1;
+    return &uac1_driver;
+#endif
+}
+
+// ----------------------------------------------------------------------------
+// Class driver implementation
+// ----------------------------------------------------------------------------
+
+static void uac1_driver_init(void) {
+    memset(&uac1, 0, sizeof(uac1));
+}
+
+static bool uac1_driver_deinit(void) {
+    return true;
+}
+
+static void uac1_driver_reset(uint8_t rhport) {
+    (void)rhport;
+    uac1.ep_data_open = false;
+    uac1.ep_fb_open = false;
+    uac1.notify_ep_open = false;
+    uac1.cur_alt = 0;
+    uac1.vendor_itf = 0xFF;
+    usb_audio_alt_set = 0;
+
+    // Clear any pending notifications — they would be stale post-reset.
+    notify_reset_queue();
+    notify_master_vol_host_initiated = false;
+}
+
+static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
+    // Second call path: vendor interface (class 0xFF).  TinyUSB calls open()
+    // again with this interface after we've claimed AC+AS.  The vendor
+    // interface has bNumEndpoints = 1 (interrupt IN EP 0x83 for device→host
+    // notifications); accept 0 too for defensive forward compat.
+    if (itf_desc->bInterfaceClass == 0xFF &&
+        itf_desc->bAlternateSetting == 0 &&
+        itf_desc->bNumEndpoints <= 1) {
+        uac1.vendor_itf = itf_desc->bInterfaceNumber;
+
+        uint16_t drv_len = tu_desc_len(itf_desc);       // 9 bytes for std itf
+        if (itf_desc->bNumEndpoints == 1) {
+            // The interrupt EP descriptor follows immediately.
+            uint8_t const *ep_desc = (uint8_t const *)itf_desc + tu_desc_len(itf_desc);
+            if (tu_desc_type(ep_desc) == TUSB_DESC_ENDPOINT) {
+                TU_ASSERT(usbd_edpt_open(rhport, (tusb_desc_endpoint_t const *)ep_desc));
+                uac1.notify_ep_open = true;
+                drv_len += tu_desc_len(ep_desc);         // 7 bytes for std EP
+            }
+        }
+        return drv_len;
+    }
+
+    // Claim the UAC1 AC interface (don't check bInterfaceProtocol — UAC1 uses 0x00).
+    TU_VERIFY(itf_desc->bInterfaceClass == TUSB_CLASS_AUDIO);
+    TU_VERIFY(itf_desc->bInterfaceSubClass == AUDIO_SUBCLASS_CONTROL);
+    TU_VERIFY(itf_desc->bAlternateSetting == 0);
+#ifdef DSPI_LOOPBACK
+    // With the loopback capture function present there is a SECOND audio-control
+    // interface (ITF_NUM_LOOPBACK_AC).  Scope this driver to the playback AC
+    // interface so it doesn't claim — and hijack — the capture function; the
+    // loopback driver claims ITF_NUM_LOOPBACK_AC.
+    TU_VERIFY(itf_desc->bInterfaceNumber == ITF_NUM_AUDIO_CONTROL);
+#endif
+
+    uac1.ac_itf = itf_desc->bInterfaceNumber;
+
+    uint8_t const *p_desc = (uint8_t const *)itf_desc;
+    uint8_t const *p_end  = p_desc + max_len;
+    uint16_t drv_len = 0;
+
+    // Skip AC standard interface descriptor.
+    drv_len += tu_desc_len(p_desc);
+    p_desc += tu_desc_len(p_desc);
+
+    // Walk AC class-specific descriptors (header, input terminal, feature unit, output terminal).
+    while (p_desc < p_end && tu_desc_type(p_desc) == TUSB_DESC_CS_INTERFACE) {
+        drv_len += tu_desc_len(p_desc);
+        p_desc += tu_desc_len(p_desc);
+    }
+
+    // Walk all AS alt settings (0, 1, 2) and their endpoints.
+    // Reserve worst-case DPRAM for the data OUT and feedback IN endpoints.
+#ifdef TUP_DCD_EDPT_ISO_ALLOC
+    bool allocated_out = false;
+    bool allocated_fb = false;
+#endif
+
+    while (p_desc < p_end && tu_desc_type(p_desc) == TUSB_DESC_INTERFACE) {
+        tusb_desc_interface_t const *as = (tusb_desc_interface_t const *)p_desc;
+        if (as->bInterfaceClass != TUSB_CLASS_AUDIO ||
+            as->bInterfaceSubClass != AUDIO_SUBCLASS_STREAMING) {
+            break;
+        }
+        uac1.as_itf = as->bInterfaceNumber;
+
+        drv_len += tu_desc_len(p_desc);
+        p_desc += tu_desc_len(p_desc);
+
+        // Consume this alt's class-specific + endpoint descriptors up to the
+        // next standard interface descriptor or end.
+        while (p_desc < p_end && tu_desc_type(p_desc) != TUSB_DESC_INTERFACE) {
+#ifdef TUP_DCD_EDPT_ISO_ALLOC
+            if (tu_desc_type(p_desc) == TUSB_DESC_ENDPOINT) {
+                tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *)p_desc;
+                if (ep->bmAttributes.xfer == TUSB_XFER_ISOCHRONOUS) {
+                    uint16_t mps = tu_edpt_packet_size(ep);
+                    uint8_t  ep_addr = ep->bEndpointAddress;
+                    if (ep_addr == AUDIO_OUT_ENDPOINT && !allocated_out) {
+                        usbd_edpt_iso_alloc(rhport, ep_addr, AUDIO_EP_MAX_PKT);
+                        allocated_out = true;
+                    } else if (ep_addr == AUDIO_IN_ENDPOINT && !allocated_fb) {
+                        (void)mps;
+                        usbd_edpt_iso_alloc(rhport, ep_addr, 4);
+                        allocated_fb = true;
+                    }
+                }
+            }
+#endif
+            drv_len += tu_desc_len(p_desc);
+            p_desc += tu_desc_len(p_desc);
+        }
+    }
+
+    // Enable SOF events for our driver (needed for feedback servo tick).
+    usbd_sof_enable(rhport, SOF_CONSUMER_AUDIO, true);
+
+    return drv_len;
+}
+
+// Arm a fresh data OUT xfer.  Called once on alt>0 activation and from xfer_cb
+// completion.
+static inline void uac1_arm_data_out(uint8_t rhport) {
+    usbd_edpt_xfer(rhport, AUDIO_OUT_ENDPOINT, ep_out_buf, AUDIO_EP_MAX_PKT);
+}
+
+// Arm a fresh feedback IN xfer with the current 10.14 feedback value.
+static inline void uac1_arm_feedback(uint8_t rhport) {
+    uint32_t fb = feedback_10_14;
+    if (fb == 0) fb = nominal_feedback_10_14;
+    ep_fb_buf[0] = (uint8_t)(fb & 0xFF);
+    ep_fb_buf[1] = (uint8_t)((fb >> 8) & 0xFF);
+    ep_fb_buf[2] = (uint8_t)((fb >> 16) & 0xFF);
+    ep_fb_buf[3] = 0;
+    usbd_edpt_xfer(rhport, AUDIO_IN_ENDPOINT, ep_fb_buf, 3);
+}
+
+// Open isochronous endpoints for the specified alt (1..5 on RP2350, 1..2 else).
+static bool uac1_open_stream_eps(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt < 1 || alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input
+#else
+    if (alt != 1 && alt != 2) return false;
+#endif
+
+    const uint8_t *data_ep = usb_audio_data_ep_desc[alt - 1];
+    const uint8_t *fb_ep   = usb_audio_fb_ep_desc[alt - 1];
+
+#ifdef TUP_DCD_EDPT_ISO_ALLOC
+    TU_ASSERT(usbd_edpt_iso_activate(rhport, (tusb_desc_endpoint_t const *)data_ep));
+    TU_ASSERT(usbd_edpt_iso_activate(rhport, (tusb_desc_endpoint_t const *)fb_ep));
+#else
+    TU_ASSERT(usbd_edpt_open(rhport, (tusb_desc_endpoint_t const *)data_ep));
+    TU_ASSERT(usbd_edpt_open(rhport, (tusb_desc_endpoint_t const *)fb_ep));
+#endif
+    // usbd_edpt_close() is a no-op when TUP_DCD_EDPT_ISO_ALLOC is defined, so
+    // alt-switching leaves two pieces of stale state behind on each iso EP:
+    //
+    //   1. The TinyUSB stack-level `busy` flag (from the previous alt's
+    //      in-flight xfer) — would trip TU_ASSERT(busy == 0) in
+    //      usbd_edpt_xfer() (usbd.c:1337).
+    //
+    //   2. The RP2040/RP2350 hardware-level USB_BUF_CTRL_AVAIL bit in the
+    //      EP's buffer_control register — iso EPs hold AVAIL set while
+    //      waiting for the next packet; the host stops sending on the old
+    //      alt without clearing it, so the next arm panics with
+    //      "ep XX was already available" (rp2040_usb.c:108).
+    //
+    // Stall → clear_stall flushes BOTH: dcd_edpt_stall() overwrites
+    // buffer_control with just USB_BUF_CTRL_STALL (clearing AVAIL),
+    // dcd_edpt_clear_stall() then clears STALL, leaving buffer_control=0
+    // and stack-level busy/stalled flags cleared.
+    usbd_edpt_stall(rhport, AUDIO_OUT_ENDPOINT);
+    usbd_edpt_clear_stall(rhport, AUDIO_OUT_ENDPOINT);
+    usbd_edpt_stall(rhport, AUDIO_IN_ENDPOINT);
+    usbd_edpt_clear_stall(rhport, AUDIO_IN_ENDPOINT);
+
+    uac1.ep_data_open = true;
+    uac1.ep_fb_open = true;
+
+    uac1_arm_data_out(rhport);
+    uac1_arm_feedback(rhport);
+    return true;
+}
+
+// Drain/arm the interrupt IN endpoint.  Always keeps EP 0x83 armed: if a
+// Drain the notification queue to the bulk IN endpoint.  Follows TinyUSB's
+// recommended pattern (same as HID's tud_hid_n_report):
+//   1. Bail early if no event is pending — bulk IN doesn't need keep-alives.
+//   2. Atomic claim of the EP via usbd_edpt_claim (checks busy && !claimed).
+//   3. Fill the stable TX buffer while holding the claim.
+//   4. usbd_edpt_xfer kicks off the transfer; claim is released on completion.
+//
+// The claim-based pattern eliminates the race window between checking busy
+// and calling usbd_edpt_xfer that our previous code had.  If the EP is
+// currently busy (xfer in flight) or already claimed by another path, claim
+// returns false and we defer to the next tick / xfer_cb re-arm.
+static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
+    if (!uac1.notify_ep_open) return;
+
+    // Always-armed pattern: keep a transfer in flight on EP 0x83 at all
+    // times.  When the event ring is empty, we arm a 1-byte idle packet
+    // (0x00) instead of bailing.  Reasons:
+    //
+    // 1. macOS IOKit has been observed to drop the first bulk packet
+    //    after a long idle period — the pipe state gets "cold" and the
+    //    first packet after the gap is lost, while subsequent packets
+    //    arrive normally.  Keeping the pipe hot with idle keep-alives
+    //    eliminates this.
+    //
+    // 2. The original firmware descriptor comment documented this intent
+    //    ("device always keeps EP 0x83 armed") but the actual drain bailed
+    //    on empty ring; this change aligns the behavior with the comment.
+    //
+    // The Swift monitor discards 1-byte idle packets (byte 0 == 0x00),
+    // so the user-visible event stream is unaffected.
+    if (!usbd_edpt_claim(rhport, NOTIFY_IN_ENDPOINT)) {
+        // EP already busy/claimed — xfer_cb will re-arm when it completes.
+        return;
+    }
+
+    uint16_t len;
+    bool consumed_ring_entry = false;
+
+    if (notify_has_pending_for(NOTIFY_CONSUMER_USB)) {
+        // Format the next queued event.  peek does NOT advance the tail;
+        // we commit only after the xfer is accepted by DCD.
+        len = notify_peek_next_for(NOTIFY_CONSUMER_USB, notify_buf,
+                                   NOTIFY_EP_MAX_PKT);
+        consumed_ring_entry = (len > 0);
+    } else {
+        len = 0;
+    }
+
+    if (len == 0) {
+        // Ring empty (or unknown event_id).  Arm an idle keep-alive.
+        notify_buf[0] = 0x00;
+        len = 1;
+        consumed_ring_entry = false;
+    }
+
+    if (!usbd_edpt_xfer(rhport, NOTIFY_IN_ENDPOINT, notify_buf, len)) {
+        // DCD rejected — release claim.  If we snapshotted a ring entry,
+        // leave the tail where it is so the next tick retries the same
+        // event.
+        usbd_edpt_release(rhport, NOTIFY_IN_ENDPOINT);
+        return;
+    }
+
+    // Xfer accepted.  Advance the ring tail only if this packet represented
+    // a real event; idle keep-alives don't consume ring entries.
+    if (consumed_ring_entry) {
+        notify_commit_pop_for(NOTIFY_CONSUMER_USB);
+    }
+}
+
+static void uac1_close_stream_eps(uint8_t rhport) {
+    if (uac1.ep_data_open) {
+        usbd_edpt_close(rhport, AUDIO_OUT_ENDPOINT);
+        uac1.ep_data_open = false;
+    }
+    if (uac1.ep_fb_open) {
+        usbd_edpt_close(rhport, AUDIO_IN_ENDPOINT);
+        uac1.ep_fb_open = false;
+    }
+}
+
+// Apply a new AS alt setting.  Alts: 0 = zero-bw; 1 = 2ch/16; 2 = 2ch/24;
+// and (RP2350 only) 3 = 4ch, 4 = 6ch, 5 = 8ch (all 48 kHz / 16-bit).
+static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input (RP2350 only)
+#else
+    if (alt > 2) return false;
+#endif
+
+    uint32_t prev_alt = usb_audio_alt_set;
+
+    // Idempotent SET_INTERFACE(alt=current) is common from host driver probes.
+    // Tearing down and re-opening iso EPs for no reason just introduces a
+    // pause in the stream and a risk of DCD state desync — bail early.
+    if (alt == prev_alt) return true;
+
+    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;  // only alt 2 is 24-bit
+    uint8_t  new_channels;
+    switch (alt) {
+#if PICO_RP2350
+        case 3:  new_channels = 4; break;
+        case 4:  new_channels = 6; break;
+        case 5:  new_channels = 8; break;
+#endif
+        default: new_channels = NUM_STEREO_INPUTS; break;  // alt 0/1/2 = stereo
+    }
+    bool     bit_depth_changed = (new_bit_depth != usb_input_bit_depth);
+    bool     channels_changed  = (new_channels != usb_input_channels);
+    bool     format_changed    = bit_depth_changed || channels_changed;
+    // Any active→active transition (e.g. alt 1↔alt 2, or a channel-count
+    // change) needs the same mute/drain/feedback-reset treatment as a cold
+    // start (alt 0→>0).  Otherwise stale consumer-pool audio plays out across
+    // the switch and a drifted feedback value is handed back to the host the
+    // instant the feedback EP re-arms, producing an audible click.
+    bool need_resync = (alt > 0) && (prev_alt == 0 || format_changed);
+
+    usb_audio_alt_set = alt;
+    uac1.cur_alt = alt;
+    usb_input_bit_depth = new_bit_depth;
+    usb_input_channels  = new_channels;
+
+    // If the format (bit depth or channel count) is changing, any packets still
+    // queued in the ring were encoded under the old layout. Decoding them with
+    // the new bytes/frame assumption would misread sample counts and channel
+    // layout. Flush them.
+    if (format_changed) {
+        usb_audio_flush_ring();
+    }
+
+    // Tell the host (DSPi Console) the active input channel count changed so it
+    // can relayout its mixer/sidebar immediately, without waiting for the next
+    // status poll.
+    if (channels_changed) {
+        notify_push_input_format(new_channels);
+    }
+
+#if PICO_RP2350
+    // Multichannel alts advertise 48 kHz only.  Retain that USB endpoint state
+    // while USB is inactive without disturbing the rate owned by another input.
+    if (new_channels > NUM_STEREO_INPUTS)
+        usb_audio_set_selected_rate(48000u);
+#endif
+
+    bool active = (alt > 0);
+    audio_spdif_set_starvation_monitoring(active);
+    audio_i2s_set_starvation_monitoring(active);
+#if PICO_RP2350
+    // ADAT slaves its silence insertion to slot 0's starvation counter while
+    // the stream is active (see adat_output.c).
+    adat_output_set_stream_active(active);
+#endif
+    audio_ring_last_push_us = 0;
+
+    if (active) {
+        // Only run the resync cascade when USB is the active input source.
+        // In SPDIF (or any non-USB) mode, the host's stream is decorative —
+        // we keep the iso EPs up so the host stays happy, but we must not
+        // touch preset_loading (the SPDIF input handler treats that as a
+        // lock-acquisition signal and would yank the outputs) and must not
+        // queue stream_restart_resync_pending (which fires complete_pipeline_reset
+        // inside save_and_disable_interrupts() and could starve the SPDIF
+        // RX library's 10ms decode-timeout alarm).
+        if (need_resync && active_input_source == INPUT_SOURCE_USB) {
+            // Engage the mute envelope immediately so any packets decoded
+            // between here and the main-loop's full pipeline resync are
+            // silenced. Main loop will honor stream_restart_resync_pending
+            // and do prepare/complete_pipeline_reset (consumer drain + sync
+            // restart). The mute window covers that entire interval.
+            preset_mute_counter = PRESET_MUTE_SAMPLES;
+            preset_loading = true;
+
+            // Reset feedback + sync state so the loop doesn't resume with
+            // drifted values that would cause the host to emit off-size
+            // packets right after the alt change.
+            fb_ctrl_stream_stop(&fb_ctrl);
+            feedback_10_14 = nominal_feedback_10_14;
+            extern volatile bool sync_started;
+            extern volatile uint64_t total_samples_produced;
+            sync_started = false;
+            total_samples_produced = 0;
+
+            audio_spdif_reset_dma_starvations();
+            stream_restart_resync_pending = true;
+            __dmb();
+        }
+        // Open (or reopen if bit-depth changed) isochronous endpoints.
+        uac1_close_stream_eps(rhport);
+        if (!uac1_open_stream_eps(rhport, alt)) return false;
+    } else {
+        uac1_close_stream_eps(rhport);
+        if (prev_alt > 0) {
+            fb_ctrl_stream_stop(&fb_ctrl);
+            feedback_10_14 = nominal_feedback_10_14;
+        }
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Class + standard control requests
+// ----------------------------------------------------------------------------
+
+// UAC1 feature unit (entity 2) — mute + master volume.
+static bool uac1_handle_fu_get(uint8_t rhport, tusb_control_request_t const *req) {
+    uint8_t cs = TU_U16_HIGH(req->wValue);
+    switch (req->bRequest) {
+        case UAC1_REQ_GET_CUR:
+            if (cs == UAC1_FU_CTRL_MUTE) {
+                static uint8_t m;
+                m = audio_state.mute ? 1 : 0;
+                return tud_control_xfer(rhport, req, &m, 1);
+            }
+            if (cs == UAC1_FU_CTRL_VOLUME) {
+                static int16_t v;
+                v = audio_state.volume;
+                return tud_control_xfer(rhport, req, &v, 2);
+            }
+            break;
+        case UAC1_REQ_GET_MIN:
+            if (cs == UAC1_FU_CTRL_VOLUME) {
+                static int16_t v = MIN_VOLUME;
+                return tud_control_xfer(rhport, req, &v, 2);
+            }
+            break;
+        case UAC1_REQ_GET_MAX:
+            if (cs == UAC1_FU_CTRL_VOLUME) {
+                static int16_t v = MAX_VOLUME;
+                return tud_control_xfer(rhport, req, &v, 2);
+            }
+            break;
+        case UAC1_REQ_GET_RES:
+            if (cs == UAC1_FU_CTRL_VOLUME) {
+                static int16_t v = VOLUME_RESOLUTION;
+                return tud_control_xfer(rhport, req, &v, 2);
+            }
+            break;
+    }
+    return false;
+}
+
+static bool uac1_handle_ep_get(uint8_t rhport, tusb_control_request_t const *req) {
+    uint8_t cs = TU_U16_HIGH(req->wValue);
+    if (req->bRequest == UAC1_REQ_GET_CUR && cs == UAC1_EP_CTRL_SAMPLING_FREQ) {
+        static uint8_t freq_bytes[3];
+        uint32_t f = usb_audio_get_selected_rate();
+        freq_bytes[0] = (uint8_t)(f & 0xFF);
+        freq_bytes[1] = (uint8_t)((f >> 8) & 0xFF);
+        freq_bytes[2] = (uint8_t)((f >> 16) & 0xFF);
+        return tud_control_xfer(rhport, req, freq_bytes, 3);
+    }
+    return false;
+}
+
+static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
+    // Note: vendor-type requests never reach this callback.  TinyUSB routes
+    // them directly to tud_vendor_control_xfer_cb (usbd.c:727-730) without
+    // consulting class drivers.  See vendor_commands.c for the vendor dispatch.
+
+    if (stage == CONTROL_STAGE_SETUP) {
+        // --- Standard requests on our interfaces ---
+        if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
+            if (req->bRequest == TUSB_REQ_SET_INTERFACE) {
+                uint8_t itf = TU_U16_LOW(req->wIndex);
+                uint8_t alt = TU_U16_LOW(req->wValue);
+                if (itf == uac1.ac_itf) {
+                    // AC interface only has alt 0
+                    if (alt != 0) return false;
+                    return tud_control_status(rhport, req);
+                }
+                if (itf == uac1.as_itf) {
+                    if (!uac1_apply_alt(rhport, alt)) return false;
+                    return tud_control_status(rhport, req);
+                }
+                if (itf == uac1.vendor_itf) {
+                    // Vendor interface has only alt 0
+                    if (alt != 0) return false;
+                    return tud_control_status(rhport, req);
+                }
+                return false;
+            }
+            if (req->bRequest == TUSB_REQ_GET_INTERFACE) {
+                uint8_t itf = TU_U16_LOW(req->wIndex);
+                static uint8_t alt_resp;
+                if (itf == uac1.ac_itf) {
+                    alt_resp = 0;
+                } else if (itf == uac1.as_itf) {
+                    alt_resp = uac1.cur_alt;
+                } else if (itf == uac1.vendor_itf) {
+                    alt_resp = 0;
+                } else {
+                    return false;
+                }
+                return tud_control_xfer(rhport, req, &alt_resp, 1);
+            }
+            return false;
+        }
+
+        // --- Class requests ---
+        if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS) {
+            uint8_t recipient = req->bmRequestType_bit.recipient;
+            bool is_get = (req->bmRequestType_bit.direction == TUSB_DIR_IN);
+
+            if (recipient == TUSB_REQ_RCPT_INTERFACE) {
+                uint8_t itf      = TU_U16_LOW(req->wIndex);
+                uint8_t entityID = TU_U16_HIGH(req->wIndex);
+                if (itf != uac1.ac_itf) return false;
+                if (entityID != UAC1_FEATURE_UNIT_ID) return false;
+
+                if (is_get) return uac1_handle_fu_get(rhport, req);
+
+                // SET_CUR: schedule data stage.
+                if (req->bRequest == UAC1_REQ_SET_CUR) {
+                    uint16_t len = req->wLength;
+                    if (len == 0 || len > sizeof(uac1_ctrl_buf)) return false;
+                    uac1.pending_cs        = TU_U16_HIGH(req->wValue);
+                    uac1.pending_recipient = TUSB_REQ_RCPT_INTERFACE;
+                    uac1.pending_len       = (uint8_t)len;
+                    return tud_control_xfer(rhport, req, uac1_ctrl_buf, len);
+                }
+                return false;
+            }
+
+            if (recipient == TUSB_REQ_RCPT_ENDPOINT) {
+                uint8_t ep = TU_U16_LOW(req->wIndex);
+                if (ep != AUDIO_OUT_ENDPOINT) return false;
+
+                if (is_get) return uac1_handle_ep_get(rhport, req);
+
+                if (req->bRequest == UAC1_REQ_SET_CUR) {
+                    uint16_t len = req->wLength;
+                    if (len == 0 || len > sizeof(uac1_ctrl_buf)) return false;
+                    uac1.pending_cs        = TU_U16_HIGH(req->wValue);
+                    uac1.pending_recipient = TUSB_REQ_RCPT_ENDPOINT;
+                    uac1.pending_len       = (uint8_t)len;
+                    return tud_control_xfer(rhport, req, uac1_ctrl_buf, len);
+                }
+                return false;
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    if (stage == CONTROL_STAGE_DATA) {
+        // Apply SET_CUR payload captured at SETUP.
+        if (req->bmRequestType_bit.type != TUSB_REQ_TYPE_CLASS) return true;
+        if (uac1.pending_recipient == TUSB_REQ_RCPT_INTERFACE) {
+            if (uac1.pending_cs == UAC1_FU_CTRL_MUTE) {
+                audio_state.mute = uac1_ctrl_buf[0];
+            } else if (uac1.pending_cs == UAC1_FU_CTRL_VOLUME) {
+                int16_t v;
+                memcpy(&v, uac1_ctrl_buf, sizeof(v));
+                // PARAM_SRC_UAC1 distinguishes OS-slider writes from vendor
+                // EP0 (PARAM_SRC_HOST_SET) and LG Sound Sync writes on the
+                // same shared field — hosts that watch user_volume.user_volume_db
+                // can attribute the change correctly.
+                notify_set_source(PARAM_SRC_UAC1);
+                audio_set_volume(v);
+                // Mirror update_user_volume()'s emit so v2 hosts see the
+                // OS volume slider move on the same WireBulkParams field
+                // they listen to for vendor-channel writes.  Clamp to the
+                // documented apply range; the dB the listener actually
+                // hears is what the device should report.
+                float notify_db = (float)v / 256.0f;
+                if (notify_db < -(float)CENTER_VOLUME_INDEX) notify_db = -(float)CENTER_VOLUME_INDEX;
+                if (notify_db > 0.0f) notify_db = 0.0f;
+                notify_param_write(offsetof(WireBulkParams, user_volume.user_volume_db),
+                                   sizeof(float), &notify_db);
+                notify_set_source(PARAM_SRC_UNKNOWN);
+            }
+        } else if (uac1.pending_recipient == TUSB_REQ_RCPT_ENDPOINT) {
+            if (uac1.pending_cs == UAC1_EP_CTRL_SAMPLING_FREQ) {
+                uint32_t new_freq = (uint32_t)uac1_ctrl_buf[0]
+                                  | ((uint32_t)uac1_ctrl_buf[1] << 8)
+                                  | ((uint32_t)uac1_ctrl_buf[2] << 16);
+                // Only accept rates that the AS alt descriptors advertise.
+                // Accepting arbitrary values used to commit audio_state.freq
+                // to garbage that perform_rate_change() would silently
+                // coerce to 44100 — GET_CUR would then lie to the host.
+                bool rate_ok;
+#if PICO_RP2350
+                if (usb_input_channels > NUM_STEREO_INPUTS) {
+                    // Multichannel alts (4/6/8) advertise a single rate: 48 kHz.
+                    rate_ok = (new_freq == 48000u);
+                } else
+#endif
+                {
+                    rate_ok = (new_freq == 44100u ||
+                               new_freq == 48000u ||
+                               new_freq == 96000u);
+                }
+                if (!rate_ok) {
+                    // Stall EP0 — per UAC1, unsupported control values
+                    // must be rejected rather than silently clamped.
+                    uac1.pending_recipient = 0;
+                    return false;
+                }
+                usb_audio_set_selected_rate(new_freq);
+            }
+        }
+        uac1.pending_recipient = 0;
+        return true;
+    }
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Endpoint transfer completion — audio RX producer + feedback re-arm.
+// Runs in USB IRQ context (rp2040/rp2350 DCD fires xfer_cb synchronously).
+// ----------------------------------------------------------------------------
+
+static bool __not_in_flash_func(uac1_driver_xfer_cb)(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
+    if (ep_addr == AUDIO_OUT_ENDPOINT) {
+        if (result == XFER_RESULT_SUCCESS && xferred_bytes > 0) {
+            usb_audio_packets++;
+
+            // Gap detection at actual packet arrival time (preserves the same
+            // fault-counting semantics as the old _as_audio_packet callback).
+            uint32_t now = time_us_32();
+            if (audio_ring_last_push_us > 0 && !preset_loading) {
+                uint32_t gap = now - audio_ring_last_push_us;
+                if (gap > 2000 && gap < 50000) {
+                    spdif_underruns++;
+                }
+            }
+            audio_ring_last_push_us = now;
+
+            // Only queue host audio when USB is the active DSP input source.
+            // In SPDIF mode the ring would never be drained, every push past
+            // the 4-slot ring fill would bump overrun_count for no reason,
+            // and (more importantly) the data would be discarded anyway.
+            if (active_input_source == INPUT_SOURCE_USB) {
+                usb_audio_ring_push(&audio_ring, ep_out_buf,
+                                    xferred_bytes > 0xFFFFu ? 0xFFFFu : (uint16_t)xferred_bytes);
+            }
+        }
+        // Re-arm regardless of this frame's success — iso transfers fail-open.
+        if (uac1.ep_data_open) uac1_arm_data_out(rhport);
+        return true;
+    }
+
+    if (ep_addr == AUDIO_IN_ENDPOINT) {
+        // Feedback packet transmitted; publish the current value and re-arm.
+        if (uac1.ep_fb_open) uac1_arm_feedback(rhport);
+        return true;
+    }
+
+    if (ep_addr == NOTIFY_IN_ENDPOINT) {
+        // Notification delivered; send the next pending one, if any.
+        if (uac1.notify_ep_open) usb_notify_drain(rhport);
+        return true;
+    }
+
+    return false;
+}
+
+// ----------------------------------------------------------------------------
+// SOF tick — measures device clock vs host clock, drives the Q16.16 feedback
+// servo.  Replaces the old usb_sof_irq() that lived in main.c.
+// ----------------------------------------------------------------------------
+
+static void __not_in_flash_func(uac1_driver_sof)(uint8_t rhport, uint32_t frame_count) {
+    (void)rhport;
+    (void)frame_count;
+
+    extern audio_spdif_instance_t *spdif_instance_ptrs[];
+    extern volatile bool output_type_switch_in_progress;
+
+    // Skip during output-type reconfiguration (slot ownership is transiently
+    // inconsistent; reading DMA state could crash).
+    if (output_type_switch_in_progress) return;
+
+    volatile uint32_t *p_words_consumed;
+    uint32_t xfer_words;
+    uint8_t dma_ch;
+    uint8_t slot0_type = output_types[0];
+    uint32_t rate_shift;
+
+    if (slot0_type == OUTPUT_TYPE_I2S) {
+        audio_i2s_instance_t *inst = i2s_instance_ptrs[0];
+        p_words_consumed = &inst->words_consumed;
+        xfer_words = inst->current_transfer_words;
+        dma_ch = inst->dma_channel;
+        rate_shift = 13;
+    } else {
+        audio_spdif_instance_t *inst = spdif_instance_ptrs[0];
+        p_words_consumed = &inst->words_consumed;
+        xfer_words = inst->current_transfer_words;
+        dma_ch = inst->dma_channel;
+        rate_shift = 12;
+    }
+
+    uint32_t remaining = dma_channel_hw_addr(dma_ch)->transfer_count;
+    uint32_t current_total = *p_words_consumed + (xfer_words - remaining);
+
+    fb_ctrl_sof_update(&fb_ctrl, current_total, rate_shift, spdif0_consumer_fill);
+
+    if (active_input_source != INPUT_SOURCE_USB) {
+        // In non-USB modes the host's stream is decorative.  Output DMA can
+        // be transiently stalled (SPDIF prefill window, lock loss) which
+        // would let the servo emit zero/garbage feedback values — Windows
+        // usbaudio.sys treats catastrophic feedback drift as a device fault
+        // and resets the device (which also drops the bulk Console pipe).
+        // Force exact nominal feedback while non-USB.
+        feedback_10_14 = nominal_feedback_10_14;
+    } else {
+        uint32_t fb_10_14 = fb_ctrl_get_10_14(&fb_ctrl);
+        if (fb_10_14) feedback_10_14 = fb_10_14;
+    }
+}
+
+// Runtime pin configuration
+#if PICO_RP2350
+uint8_t output_pins[NUM_PIN_OUTPUTS] = {
+    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
+    PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
+};
+#else
+uint8_t output_pins[NUM_PIN_OUTPUTS] = {
+    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+};
+#endif
+
+audio_spdif_instance_t *spdif_instance_ptrs[NUM_SPDIF_INSTANCES];
+
+// ---------------------------------------------------------------------------
+// OutputSlot — per-slot output type management (S/PDIF or I2S)
+// ---------------------------------------------------------------------------
+
+// Per-slot output type: OUTPUT_TYPE_SPDIF (0) or OUTPUT_TYPE_I2S (1)
+uint8_t output_types[NUM_SPDIF_INSTANCES] = {0};  // All S/PDIF by default
+
+// I2S instances — statically allocated, activated when a slot switches to I2S
+static audio_i2s_instance_t i2s_instance_1 = {0};
+static audio_i2s_instance_t i2s_instance_2 = {0};
+#if PICO_RP2350
+static audio_i2s_instance_t i2s_instance_3 = {0};
+static audio_i2s_instance_t i2s_instance_4 = {0};
+#endif
+
+// Indexed arrays for both instance types (populated in usb_sound_card_init)
+audio_i2s_instance_t *i2s_instance_ptrs[NUM_SPDIF_INSTANCES];
+struct audio_buffer_pool *producer_pools[NUM_SPDIF_INSTANCES];
+
+// Per-slot static consumer-pool storage (BSS). One pool per output slot, shared by
+// the slot's S/PDIF and I2S instances and reused across output-type switches — sized
+// for the largest type (S/PDIF, stride PICO_AUDIO_SPDIF_CONSUMER_FRAME_BYTES); I2S
+// (stride 8) under-fills each block. No heap, so the linker budgets it at build time
+// and the previous output-retype alloc/free (and its fragmentation/OOM risk) is gone.
+#define SLOT_CONSUMER_DATA_BYTES_PER_BUF \
+    (PICO_AUDIO_SPDIF_DMA_SAMPLE_COUNT * PICO_AUDIO_SPDIF_CONSUMER_FRAME_BYTES)
+static audio_buffer_pool_t slot_consumer_pool_store[NUM_SPDIF_INSTANCES];
+static audio_buffer_t      slot_consumer_buffers[NUM_SPDIF_INSTANCES][SPDIF_CONSUMER_BUFFER_COUNT];
+static mem_buffer_t        slot_consumer_mems[NUM_SPDIF_INSTANCES][SPDIF_CONSUMER_BUFFER_COUNT];
+static uint8_t             slot_consumer_data[NUM_SPDIF_INSTANCES][SPDIF_CONSUMER_BUFFER_COUNT * SLOT_CONSUMER_DATA_BYTES_PER_BUF];
+audio_buffer_pool_t *slot_consumer_pools[NUM_SPDIF_INSTANCES];  // shared per-slot pools (used on retype)
+_Static_assert(PICO_AUDIO_I2S_CONSUMER_FRAME_BYTES <= PICO_AUDIO_SPDIF_CONSUMER_FRAME_BYTES,
+               "shared per-slot consumer pool is sized for S/PDIF; I2S frames must fit");
+
+// I2S clock configuration
+uint8_t i2s_bck_pin = PICO_I2S_BCK_PIN;     // BCK GPIO; LRCLK = BCK + 1
+// Clock-pin mode + slave-mode pair (see audio_input.h / clock_pins_spec.md).
+// The slave pair is dormant unless SPLIT mode AND slave clock mode are both
+// selected; i2s_effective_bck_pin() resolves the pair the hardware uses.
+uint8_t i2s_clock_pin_mode = I2S_CLOCK_PIN_MODE_UNIFIED;
+uint8_t i2s_bck_pin_slave = PICO_I2S_BCK_PIN_SLAVE;
+uint8_t i2s_mck_pin = PICO_I2S_MCK_PIN;     // MCK GPIO
+bool    i2s_mck_enabled = false;             // MCK enabled state
+// MCK multiplier: actual value (128 or 256).
+// Wire/flash format uses uint8_t where 256 wraps to 0 — encode/decode at boundaries only.
+uint16_t i2s_mck_multiplier = 128;
+
+
+// ----------------------------------------------------------------------------
+// INIT
+// ----------------------------------------------------------------------------
+
+// S/PDIF Instances
+static audio_spdif_instance_t spdif_instance_1 = {0};  // Out 1-2
+static audio_spdif_instance_t spdif_instance_2 = {0};  // Out 3-4
+#if PICO_RP2350
+static audio_spdif_instance_t spdif_instance_3 = {0};  // Out 5-6
+static audio_spdif_instance_t spdif_instance_4 = {0};  // Out 7-8
+#endif
+
+struct audio_spdif_config spdif_config_1 = {
+    .pin = PICO_AUDIO_SPDIF_PIN,  // GPIO 6
+    .dma_channel = 0,
+    .pio_sm = 0,
+    .pio = PICO_AUDIO_SPDIF_PIO,
+    .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+};
+
+struct audio_spdif_config spdif_config_2 = {
+    .pin = PICO_SPDIF_PIN_2,  // GPIO 7
+    .dma_channel = 1,
+    .pio_sm = 1,
+    .pio = PICO_AUDIO_SPDIF_PIO,
+    .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+};
+
+#if PICO_RP2350
+struct audio_spdif_config spdif_config_3 = {
+    .pin = PICO_SPDIF_PIN_3,  // GPIO 8
+    .dma_channel = 2,
+    .pio_sm = 2,
+    .pio = PICO_AUDIO_SPDIF_PIO,
+    .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+};
+
+struct audio_spdif_config spdif_config_4 = {
+    .pin = PICO_SPDIF_PIN_4,  // GPIO 9
+    .dma_channel = 3,
+    .pio_sm = 3,
+    .pio = PICO_AUDIO_SPDIF_PIO,
+    .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+};
+#endif
+
+struct audio_buffer_format producer_format = { .format = &audio_format_48k, .sample_stride = 8 };
+
+// Legacy aliases
+#define spdif_instance spdif_instance_1
+#define spdif_sub_instance spdif_instance_2
+#define config spdif_config_1
+#define sub_config spdif_config_2
+
+// Initialize matrix mixer with default stereo pass-through
+static void matrix_init_defaults(void) {
+    memset(&matrix_mixer, 0, sizeof(matrix_mixer));
+
+    // Stereo pass-through on first S/PDIF pair (Out 1-2)
+    matrix_mixer.crosspoints[0][0].enabled = 1;     // L→Out1
+    matrix_mixer.crosspoints[0][0].gain_db = 0.0f;
+    matrix_mixer.crosspoints[0][0].gain_linear = 1.0f;
+
+    matrix_mixer.crosspoints[1][1].enabled = 1;     // R→Out2
+    matrix_mixer.crosspoints[1][1].gain_db = 0.0f;
+    matrix_mixer.crosspoints[1][1].gain_linear = 1.0f;
+
+    // Enable first stereo pair only by default
+    matrix_mixer.outputs[0].enabled = 1;
+    matrix_mixer.outputs[0].gain_linear = 1.0f;
+    matrix_mixer.outputs[1].enabled = 1;
+    matrix_mixer.outputs[1].gain_linear = 1.0f;
+
+    // All other outputs disabled by default (saves CPU)
+    for (int out = 2; out < NUM_OUTPUT_CHANNELS; out++) {
+        matrix_mixer.outputs[out].enabled = 0;
+        matrix_mixer.outputs[out].gain_linear = 1.0f;
+    }
+}
+
+void usb_sound_card_init(void) {
+    // Initialize matrix mixer defaults
+    matrix_init_defaults();
+    reset_buffer_watermarks();
+
+    // S/PDIF Setup (this must happen before USB init to claim DMA channels)
+    producer_pool_1 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
+    producer_pool_2 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
+#if PICO_RP2350
+    producer_pool_3 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
+    producer_pool_4 = audio_new_producer_pool(&producer_format, AUDIO_BUFFER_COUNT, 192);
+#endif
+
+    // Build one static consumer pool per slot, sized for the largest output type.
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        audio_consumer_pool_init_static(&slot_consumer_pool_store[i],
+                                        slot_consumer_buffers[i], slot_consumer_mems[i],
+                                        slot_consumer_data[i], SPDIF_CONSUMER_BUFFER_COUNT,
+                                        PICO_AUDIO_SPDIF_DMA_SAMPLE_COUNT,
+                                        PICO_AUDIO_SPDIF_CONSUMER_FRAME_BYTES);
+        slot_consumer_pools[i] = &slot_consumer_pool_store[i];
+    }
+
+    // Setup S/PDIF instances (connect_extra re-formats the slot's shared pool for S/PDIF)
+    audio_spdif_setup(&spdif_instance_1, &audio_format_48k, &spdif_config_1);
+    audio_spdif_connect_extra(&spdif_instance_1, producer_pool_1, false, slot_consumer_pools[0], NULL);
+
+    audio_spdif_setup(&spdif_instance_2, &audio_format_48k, &spdif_config_2);
+    audio_spdif_connect_extra(&spdif_instance_2, producer_pool_2, false, slot_consumer_pools[1], NULL);
+
+#if PICO_RP2350
+    audio_spdif_setup(&spdif_instance_3, &audio_format_48k, &spdif_config_3);
+    audio_spdif_connect_extra(&spdif_instance_3, producer_pool_3, false, slot_consumer_pools[2], NULL);
+
+    audio_spdif_setup(&spdif_instance_4, &audio_format_48k, &spdif_config_4);
+    audio_spdif_connect_extra(&spdif_instance_4, producer_pool_4, false, slot_consumer_pools[3], NULL);
+#endif
+
+    // Populate instance pointer arrays for pin/type config commands
+    spdif_instance_ptrs[0] = &spdif_instance_1;
+    spdif_instance_ptrs[1] = &spdif_instance_2;
+#if PICO_RP2350
+    spdif_instance_ptrs[2] = &spdif_instance_3;
+    spdif_instance_ptrs[3] = &spdif_instance_4;
+#endif
+
+    // I2S instance pointers (instances are dormant until a slot is switched to I2S)
+    i2s_instance_ptrs[0] = &i2s_instance_1;
+    i2s_instance_ptrs[1] = &i2s_instance_2;
+#if PICO_RP2350
+    i2s_instance_ptrs[2] = &i2s_instance_3;
+    i2s_instance_ptrs[3] = &i2s_instance_4;
+#endif
+
+    // Indexed producer pool array for type-switching convenience
+    producer_pools[0] = producer_pool_1;
+    producer_pools[1] = producer_pool_2;
+#if PICO_RP2350
+    producer_pools[2] = producer_pool_3;
+    producer_pools[3] = producer_pool_4;
+#endif
+
+    // MCK generator setup — uses hardware CLK_GPOUTn, not a PIO state machine.
+    // Default pin is GPIO 13 on RP2350 (clk_gpout0) and GPIO 21 on RP2040
+    // (also clk_gpout0); see config.h for the rationale and the per-platform
+    // GPOUT-capable pin set.  setup() only records the pin; the actual GPOUT
+    // block is configured on the first audio_i2s_mck_set_enabled(true) call.
+    audio_i2s_mck_setup(i2s_mck_pin);
+
+    irq_set_priority(DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
+    irq_set_priority(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
+
+    // Start all outputs synchronized
+#if PICO_RP2350
+    audio_spdif_instance_t *spdif_all[] = {
+        &spdif_instance_1, &spdif_instance_2, &spdif_instance_3, &spdif_instance_4
+    };
+    audio_spdif_enable_sync(spdif_all, 4);
+#else
+    audio_spdif_instance_t *spdif_all[] = {
+        &spdif_instance_1, &spdif_instance_2
+    };
+    audio_spdif_enable_sync(spdif_all, 2);
+#endif
+
+    // Initialize TinyUSB device stack.  The UAC1 class driver registered via
+    // usbd_app_driver_get_cb() will own the AC + AS interfaces.
+    tud_init(0);
+
+    // Initialize DSP
+    dsp_init_default_filters();
+    dsp_recalculate_all_filters(48000.0f);
+    audio_set_volume(DEFAULT_VOLUME);
+    rate_change_pending = true;
+    pending_rate = audio_state.freq;
+
+    // Initialize Core 1 EQ worker pointer to shared output buffer
+    core1_eq_work.buf_out = buf_out;
+
+    // Initialize ADC for temperature sensor
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+}
