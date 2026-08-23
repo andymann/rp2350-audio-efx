@@ -53,6 +53,16 @@
 #define QUERY_FW_RESP_LEN   4u   // cmd + major + minor + patch
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
+// Boot banner: sent once, unsolicited, right after the port comes up --
+// simple presence/liveness check for whatever's listening on the other end.
+// Not part of the command/response protocol (no command byte, no echo).
+#define BOOT_BANNER      "Andyland.info"
+#define BOOT_BANNER_LEN  (sizeof(BOOT_BANNER) - 1u)   // exclude the NUL
+
+// TX buffer must hold the largest of: a Set-FX echo/Query-FX response
+// (SET_FX_LEN) or the boot banner (BOOT_BANNER_LEN).
+#define TX_BUF_CAP  (BOOT_BANNER_LEN > SET_FX_LEN ? BOOT_BANNER_LEN : SET_FX_LEN)
+
 // ---------------------------------------------------------------------------
 // Peripheral state
 // ---------------------------------------------------------------------------
@@ -88,7 +98,7 @@ static uint32_t last_byte_time = 0;
 // TX (echo/response) pump
 // ---------------------------------------------------------------------------
 
-static uint8_t  tx_buf[MAX_FRAME_LEN];
+static uint8_t  tx_buf[TX_BUF_CAP];
 static uint8_t  tx_len = 0;
 static uint8_t  tx_pos = 0;
 
@@ -252,6 +262,15 @@ void fx_control_init(void) {
     uart_set_irq_enables(g_uart, true, false);  // RX + RX-timeout, no TX IRQ
 
     g_is_live = true;
+
+    // Queue the boot banner. Bytes go into the UART's TX FIFO here (a few
+    // microseconds), not onto the wire -- the peripheral shifts them out
+    // asynchronously over the following ~14ms at 9600 baud while the rest of
+    // boot proceeds, so this does not block. If a Set/Query command arrives
+    // before the banner finishes draining, it queues in the RX ring and is
+    // parsed once the banner's TX completes (fx_control_poll() drains tx_buf
+    // before parsing new frames).
+    start_tx((const uint8_t *)BOOT_BANNER, BOOT_BANNER_LEN);
 }
 
 void fx_control_poll(void) {

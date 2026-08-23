@@ -33,6 +33,11 @@
  *     Response is always 4 bytes: 0x03, FW_VERSION_MAJOR, FW_VERSION_MINOR,
  *     FW_VERSION_PATCH.
  *
+ * On boot, before any command is processed, the device sends the literal
+ * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a
+ * liveness/presence banner. It is not part of the command/response protocol
+ * -- it carries no command byte and expects no reply.
+ *
  * Design rule (matches the rest of the control-interface code in this
  * project): nothing here ever blocks or busy-waits. The UART IRQ only drains
  * the RX FIFO into a ring buffer; all parsing, state changes and TX happen
