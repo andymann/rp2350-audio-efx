@@ -46,11 +46,16 @@
 #define CMD_SET_FX        0x01u
 #define CMD_QUERY_FX      0x02u
 #define CMD_QUERY_FW      0x03u
+#define CMD_SET_BPM       0x04u
+#define CMD_QUERY_BPM     0x05u
 
-#define SET_FX_LEN         7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
+#define SET_FX_LEN          7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
 #define QUERY_FX_LEN        2u   // cmd + effect_num
 #define QUERY_FW_LEN        1u   // cmd only
 #define QUERY_FW_RESP_LEN   4u   // cmd + major + minor + patch
+#define SET_BPM_LEN         3u   // cmd + bpm_hi + bpm_lo
+#define QUERY_BPM_LEN       1u   // cmd only
+#define QUERY_BPM_RESP_LEN  3u   // cmd + bpm_hi + bpm_lo
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
 // Boot banner: sent once, unsolicited, right after the port comes up --
@@ -76,6 +81,9 @@ static bool          g_is_live = false;
 // ---------------------------------------------------------------------------
 
 static FxState fx_state[FX_CONTROL_NUM_EFFECTS];
+
+// Tempo, in BPM x100 (e.g. 12345 == 123.45 BPM). 0 until the first Set BPM.
+static uint16_t bpm_x100 = 0;
 
 // ---------------------------------------------------------------------------
 // RX ring (single-producer ISR, single-consumer poll)
@@ -134,10 +142,12 @@ static void pump_tx(void) {
 // unrecognised (caller drops the byte and stays in sync on the next one).
 static uint8_t expected_len_for_cmd(uint8_t cmd) {
     switch (cmd) {
-        case CMD_SET_FX:   return SET_FX_LEN;
-        case CMD_QUERY_FX: return QUERY_FX_LEN;
-        case CMD_QUERY_FW: return QUERY_FW_LEN;
-        default:           return 0;
+        case CMD_SET_FX:     return SET_FX_LEN;
+        case CMD_QUERY_FX:   return QUERY_FX_LEN;
+        case CMD_QUERY_FW:   return QUERY_FW_LEN;
+        case CMD_SET_BPM:    return SET_BPM_LEN;
+        case CMD_QUERY_BPM:  return QUERY_BPM_LEN;
+        default:             return 0;
     }
 }
 
@@ -192,11 +202,34 @@ static void handle_query_fw(void) {
     start_tx(resp, QUERY_FW_RESP_LEN);
 }
 
+// Set BPM has no invalid value (the full 0-65535 range is meaningful), so
+// this always succeeds and always echoes.
+static void handle_set_bpm(const uint8_t *f) {
+    bpm_x100 = (uint16_t)(((uint16_t)f[1] << 8) | f[2]);
+
+    // TODO: wire into the DSP pipeline once tempo-synced effects exist. For
+    // now this just updates the control-plane state fx_control_get_bpm()
+    // exposes.
+
+    start_tx(f, SET_BPM_LEN);   // echo the command verbatim
+}
+
+static void handle_query_bpm(void) {
+    uint8_t resp[QUERY_BPM_RESP_LEN] = {
+        CMD_QUERY_BPM,
+        (uint8_t)(bpm_x100 >> 8),
+        (uint8_t)(bpm_x100 & 0xFF),
+    };
+    start_tx(resp, QUERY_BPM_RESP_LEN);
+}
+
 static void dispatch_frame(void) {
     switch (frame_buf[0]) {
-        case CMD_SET_FX:   handle_set_fx(frame_buf);   break;
-        case CMD_QUERY_FX: handle_query_fx(frame_buf); break;
-        case CMD_QUERY_FW: handle_query_fw();          break;
+        case CMD_SET_FX:     handle_set_fx(frame_buf);   break;
+        case CMD_QUERY_FX:   handle_query_fx(frame_buf); break;
+        case CMD_QUERY_FW:   handle_query_fw();          break;
+        case CMD_SET_BPM:    handle_set_bpm(frame_buf);  break;
+        case CMD_QUERY_BPM:  handle_query_bpm();         break;
         default: break;   // unreachable: expected_len_for_cmd() already filtered
     }
 }
@@ -236,6 +269,7 @@ static void parse_ring(void) {
 
 void fx_control_init(void) {
     memset(fx_state, 0, sizeof(fx_state));
+    bpm_x100 = 0;
     reset_parser();
     rx_head = 0;
     rx_tail = 0;
@@ -295,4 +329,8 @@ bool fx_control_get(uint8_t effect_num, FxState *out) {
     if (effect_num >= FX_CONTROL_NUM_EFFECTS || !out) return false;
     *out = fx_state[effect_num];
     return true;
+}
+
+uint16_t fx_control_get_bpm(void) {
+    return bpm_x100;
 }
