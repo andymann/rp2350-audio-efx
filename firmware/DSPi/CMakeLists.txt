@@ -41,6 +41,8 @@ add_executable(DSPi
     flash_clkdiv.h
     flash_storage.c
     flash_storage.h
+    fx_control.c
+    fx_control.h
     i2c_control.c
     i2c_control.h
     i2s_input.c

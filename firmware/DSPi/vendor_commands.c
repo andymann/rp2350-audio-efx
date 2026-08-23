@@ -29,6 +29,7 @@
 #include "bulk_params.h"
 #include "notify.h"
 #include "uart_control.h"
+#include "fx_control.h"
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "pdm_generator.h"
@@ -364,6 +365,7 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     if (uart_ctrl_owns_pin(pin)) return true;                 // UART control (if live)
     if (i2c_ctrl_owns_pin(pin)) return true;                  // I2C control (if live)
     if (control_surfaces_owns_pin(pin)) return true;         // Control Surfaces (live bindings)
+    if (fx_control_owns_pin(pin)) return true;                // FX control UART (fixed pins, always live)
     return false;
 }
 
