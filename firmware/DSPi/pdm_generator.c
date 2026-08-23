@@ -1,0 +1,874 @@
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include "pdm_generator.h"
+#include "dsp_pipeline.h"
+#include "crossover.h"
+#include "usb_audio.h"
+#include "siggen.h"     // siggen_raw_mask: per-output EQ bypass in RAW mode
+#include "output_s24.h" // RP2350 EQ worker: in-place S24 finalization
+#include "pico/stdlib.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/clocks.h"
+#include "hardware/timer.h"
+#include "hardware/sync.h"
+#include "pico/multicore.h"
+
+// ----------------------------------------------------------------------------
+// DATA STRUCTURES
+// ----------------------------------------------------------------------------
+
+typedef struct {
+    int32_t sample;
+    bool reset;
+} pdm_msg_t;
+
+#define RING_SIZE 256
+static volatile pdm_msg_t pdm_ring[RING_SIZE];
+static volatile uint8_t pdm_head = 0;
+static volatile uint8_t pdm_tail = 0;
+
+// DMA Circular Buffer
+static uint32_t __attribute__((aligned(PDM_DMA_BUFFER_SIZE * 4))) pdm_dma_buffer[PDM_DMA_BUFFER_SIZE];
+static int pdm_dma_chan = -1;
+
+// PIO program offset and current pin (needed for pdm_change_pin)
+static uint pdm_pio_offset;
+static uint8_t pdm_current_pin = PICO_PDM_PIN;
+
+// Enable/disable flag — set by Core 0 via pdm_set_enabled(), read by Core 1
+volatile bool pdm_enabled = false;
+
+// Core 1 mode and EQ worker handshake
+volatile Core1Mode core1_mode = CORE1_MODE_IDLE;
+Core1EqWork core1_eq_work = {0};
+
+// DMA write index snapshot for buffer stats (written by Core 1, read by Core 0)
+static volatile uint32_t pdm_stats_write_idx = 0;
+
+// Set by pdm_flash_silence() (Core 0, with Core 1 parked) before a flash
+// blackout; consumed by the processing loop on resume.  See the function
+// definition for why the loop's own underrun recovery is not enough.
+static volatile bool pdm_force_reanchor = false;
+
+// Budget-based CPU load metering (Core 1 EQ worker)
+static uint32_t c1eq_load_q8 = 0;
+static uint32_t pdm_load_q8 = 0;
+
+// ----------------------------------------------------------------------------
+// RAW PIO PROGRAM
+// ----------------------------------------------------------------------------
+static const uint16_t pio_pdm_instr[] = { 0x6001 }; // 0: out pins, 1
+static const struct pio_program pio_pdm_program = { .instructions = pio_pdm_instr, .length = 1, .origin = -1 };
+
+// ----------------------------------------------------------------------------
+// UTILS
+// ----------------------------------------------------------------------------
+static uint32_t rng_state = 123456789;
+static inline uint32_t fast_rand() {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+// ----------------------------------------------------------------------------
+// NOISE-SHAPED DITHER (IIR Error Feedback)
+// ----------------------------------------------------------------------------
+// 2nd-order IIR high-pass filter for noise shaping
+// Pushes dither energy above ~8kHz with 12dB/octave slope
+// Coefficients for Butterworth HP, fc=8kHz at fs=384kHz (8 chunks * 48kHz)
+// Fixed-point Q14 format (divide by 16384)
+#define NS_B0  15778   // 0.9630
+#define NS_B1 -31556   // -1.9260
+#define NS_B2  15778   // 0.9630
+#define NS_A1  31531   // 1.9245 (negated for subtraction)
+#define NS_A2  15580   // 0.9511
+
+typedef struct {
+    int32_t x1, x2;    // Input history
+    int32_t y1, y2;    // Output history
+    int32_t err_acc;   // Error accumulator for feedback
+} noise_shaper_t;
+
+static inline int32_t noise_shaped_dither(noise_shaper_t *ns, int32_t raw_dither, int32_t quant_error) {
+    // Accumulate quantization error with decay (LP filter on error)
+    // Decay factor 0.97 in Q8 = 248
+    ns->err_acc = ((ns->err_acc * 248) >> 8) + (quant_error >> 6);
+
+    // Combine raw dither with error feedback
+    int32_t input = raw_dither - ns->err_acc;
+
+    // Apply 2nd-order Butterworth HP filter
+    int32_t output = (NS_B0 * input + NS_B1 * ns->x1 + NS_B2 * ns->x2
+                    + NS_A1 * ns->y1 - NS_A2 * ns->y2) >> 14;
+
+    // Update filter state
+    ns->x2 = ns->x1;
+    ns->x1 = input;
+    ns->y2 = ns->y1;
+    ns->y1 = output;
+
+    return output;
+}
+
+// ----------------------------------------------------------------------------
+// FUNCTIONS
+// ----------------------------------------------------------------------------
+
+void pdm_set_enabled(bool enabled) {
+    pdm_enabled = enabled;
+    __sev();  // Wake Core 1 if sleeping
+}
+
+// Fill the PDM DMA ring with the modulator's 50% duty silence pattern and arm
+// a lead re-anchor for the processing loop.
+//
+// Called from Core 0 immediately before a flash blackout, with Core 1 already
+// parked by multicore_lockout, so there is no concurrent writer.  Content only:
+// the DMA, the PIO SM, and every pointer are untouched, so PDM phase is
+// continuous across the window; the ring simply free-runs over silence
+// instead of looping the last modulator output for ~45 ms.  No-op when PDM
+// hardware was never set up.
+void pdm_flash_silence(void) {
+    if (pdm_dma_chan < 0) return;
+    for (int i = 0; i < PDM_DMA_BUFFER_SIZE; i++) {
+        pdm_dma_buffer[i] = 0xAAAAAAAA;
+    }
+    pdm_force_reanchor = true;
+    __dmb();
+}
+
+void pdm_update_clock(uint32_t freq) {
+    float div = (float)clock_get_hz(clk_sys) / (float)(freq * PDM_OVERSAMPLE);
+    pio_sm_set_clkdiv(PDM_PIO, PDM_SM, div);
+}
+
+void pdm_setup_hw(uint8_t pin) {
+    pdm_current_pin = pin;
+
+    // Pre-fill buffer with 50% duty cycle silence before DMA starts
+    for (int i = 0; i < PDM_DMA_BUFFER_SIZE; i++) {
+        pdm_dma_buffer[i] = 0xAAAAAAAA;
+    }
+
+    pdm_pio_offset = pio_add_program(PDM_PIO, &pio_pdm_program);
+    pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_wrap(&c, pdm_pio_offset, pdm_pio_offset + (pio_pdm_program.length - 1));
+    sm_config_set_out_pins(&c, pdm_current_pin, 1);
+    sm_config_set_out_shift(&c, true, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    pio_gpio_init(PDM_PIO, pdm_current_pin);
+    pio_sm_set_consecutive_pindirs(PDM_PIO, PDM_SM, pdm_current_pin, 1, true);
+    pio_sm_init(PDM_PIO, PDM_SM, pdm_pio_offset, &c);
+
+    pdm_update_clock(48000);
+    pio_sm_set_enabled(PDM_PIO, PDM_SM, true);
+
+    pdm_dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config dmac = dma_channel_get_default_config(pdm_dma_chan);
+    channel_config_set_transfer_data_size(&dmac, DMA_SIZE_32);
+    channel_config_set_read_increment(&dmac, true);
+    channel_config_set_write_increment(&dmac, false);
+    channel_config_set_dreq(&dmac, pio_get_dreq(PDM_PIO, PDM_SM, true));
+    channel_config_set_ring(&dmac, false, PDM_DMA_RING_BITS);
+    dma_channel_configure(pdm_dma_chan, &dmac, &PDM_PIO->txf[PDM_SM], pdm_dma_buffer, 0xFFFFFFFF, true);
+}
+
+void pdm_change_pin(uint8_t new_pin) {
+    assert(!pdm_enabled);
+    assert(core1_mode != CORE1_MODE_PDM);
+
+    // Safety: stop SM and abort DMA (should already be stopped)
+    pio_sm_set_enabled(PDM_PIO, PDM_SM, false);
+    dma_channel_abort(pdm_dma_chan);
+
+    // Release old pin → high-Z
+    gpio_set_function(pdm_current_pin, GPIO_FUNC_NULL);
+    gpio_set_dir(pdm_current_pin, GPIO_IN);
+
+    // Init new pin for PIO
+    pio_gpio_init(PDM_PIO, new_pin);
+    pio_sm_set_consecutive_pindirs(PDM_PIO, PDM_SM, new_pin, 1, true);
+
+    // Rebuild SM config with new pin
+    pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_wrap(&c, pdm_pio_offset, pdm_pio_offset + (pio_pdm_program.length - 1));
+    sm_config_set_out_pins(&c, new_pin, 1);
+    sm_config_set_out_shift(&c, true, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    pio_sm_init(PDM_PIO, PDM_SM, pdm_pio_offset, &c);
+
+    // Restore clock divider (pio_sm_init resets it)
+    pdm_update_clock(48000);
+
+    pdm_current_pin = new_pin;
+}
+
+void __not_in_flash_func(pdm_push_sample)(int32_t sample, bool reset) {
+    uint8_t next_head = pdm_head + 1;
+    if (next_head != pdm_tail) {
+        pdm_msg_t msg;
+        msg.sample = sample;
+        msg.reset = reset;
+        pdm_ring[pdm_head] = msg;
+        pdm_head = next_head;
+        __sev();
+    } else {
+        pdm_ring_overruns++;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// PDM PROCESSING LOOP (extracted from former pdm_core1_entry)
+// Runs sigma-delta modulation when core1_mode == CORE1_MODE_PDM
+// ----------------------------------------------------------------------------
+static void __not_in_flash_func(pdm_processing_loop)() {
+    int32_t local_pdm_err = 0;
+    int32_t local_pdm_err2 = 0;
+    uint32_t active_us_accumulator = 0;
+    uint32_t sample_counter = 0;
+    noise_shaper_t ns = {0};
+
+    const int32_t TARGET_LEAD = 256;
+
+    uint32_t local_pdm_write = 0;
+    bool hw_running = false;  // Always go through restart path on fresh entry
+
+    // Fade state
+    uint32_t fade_in_pos = 0;
+    uint32_t fade_out_pos = 0;
+    int32_t fade_base_pcm = 0;  // Last pcm_val before fade-out
+
+    while (core1_mode == CORE1_MODE_PDM || fade_out_pos > 0) {
+        // ---- Enable/disable state machine ----
+        if (!pdm_enabled && fade_out_pos == 0) {
+            if (hw_running) {
+                // Start fade-out instead of immediate stop
+                fade_out_pos = PDM_FADE_IN_SAMPLES;
+                continue;
+            }
+            __wfe();
+            continue;
+        }
+
+        // Cancel fade-out if re-enabled
+        if (pdm_enabled && fade_out_pos > 0) {
+            fade_in_pos = PDM_FADE_IN_SAMPLES - fade_out_pos;
+            fade_out_pos = 0;
+        }
+
+        if (!hw_running) {
+            // Re-enable: reset state, refill silence, restart hardware
+            for (int i = 0; i < PDM_DMA_BUFFER_SIZE; i++)
+                pdm_dma_buffer[i] = 0xAAAAAAAA;
+            pdm_tail = pdm_head;  // drain ring buffer
+            local_pdm_err = 0;
+            local_pdm_err2 = 0;
+            ns = (noise_shaper_t){0};
+            active_us_accumulator = 0;
+            sample_counter = 0;
+            pdm_load_q8 = 0;
+            fade_in_pos = 0;
+            fade_out_pos = 0;
+            fade_base_pcm = 0;
+
+            pio_sm_set_enabled(PDM_PIO, PDM_SM, true);
+
+            dma_channel_config dmac = dma_channel_get_default_config(pdm_dma_chan);
+            channel_config_set_transfer_data_size(&dmac, DMA_SIZE_32);
+            channel_config_set_read_increment(&dmac, true);
+            channel_config_set_write_increment(&dmac, false);
+            channel_config_set_dreq(&dmac, pio_get_dreq(PDM_PIO, PDM_SM, true));
+            channel_config_set_ring(&dmac, false, PDM_DMA_RING_BITS);
+            dma_channel_configure(pdm_dma_chan, &dmac, &PDM_PIO->txf[PDM_SM],
+                                  pdm_dma_buffer, 0xFFFFFFFF, true);
+
+            uint32_t ra = dma_hw->ch[pdm_dma_chan].read_addr;
+            uint32_t ri = (ra - (uint32_t)pdm_dma_buffer) / 4;
+            local_pdm_write = (ri + TARGET_LEAD) & (PDM_DMA_BUFFER_SIZE - 1);
+
+            hw_running = true;
+        }
+
+        int32_t sample_value;
+
+        // Check buffer position relative to DMA read pointer
+        uint32_t read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
+        uint32_t current_read_idx = (read_addr - (uint32_t)pdm_dma_buffer) / 4;
+
+        // Post-flash-window re-anchor: the ring lapped an unknown number of
+        // times while this core was parked, so the modulo write-read delta
+        // below cannot tell a multi-lap underrun from a valid lead (the
+        // delta > half-ring test misses roughly half the outcomes).  Re-seat
+        // the write lead unconditionally instead; without it PDM can resume
+        // with an arbitrary wrong lead, shifting PDM output by up to a full
+        // ring relative to the SPDIF/I2S slots.
+        if (pdm_force_reanchor) {
+            pdm_force_reanchor = false;
+            local_pdm_write = (current_read_idx + TARGET_LEAD) & (PDM_DMA_BUFFER_SIZE - 1);
+        }
+
+        int32_t delta = (local_pdm_write - current_read_idx) & (PDM_DMA_BUFFER_SIZE - 1);
+
+        // Underrun recovery - write pointer fell behind read pointer
+        if (delta > (PDM_DMA_BUFFER_SIZE / 2)) {
+            pdm_dma_underruns++;
+            local_pdm_err = 0;
+            local_pdm_err2 = 0;
+            local_pdm_write = (current_read_idx + TARGET_LEAD) & (PDM_DMA_BUFFER_SIZE - 1);
+            delta = TARGET_LEAD;
+        }
+
+        bool have_sample = (pdm_head != pdm_tail);
+
+        if (have_sample) {
+            pdm_msg_t msg = pdm_ring[pdm_tail];
+            pdm_tail++;
+            sample_value = msg.sample;
+        } else if (delta < TARGET_LEAD) {
+            pdm_ring_underruns++;
+            sample_value = 0;
+        } else {
+            while (pdm_head == pdm_tail) {
+                read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
+                current_read_idx = (read_addr - (uint32_t)pdm_dma_buffer) / 4;
+                delta = (local_pdm_write - current_read_idx) & (PDM_DMA_BUFFER_SIZE - 1);
+
+                if (delta < TARGET_LEAD || delta > (PDM_DMA_BUFFER_SIZE / 2)) break;
+
+                if (delta > TARGET_LEAD + 128) {
+                    __wfe();
+                }
+            }
+
+            if (pdm_head != pdm_tail) {
+                pdm_msg_t msg = pdm_ring[pdm_tail];
+                pdm_tail++;
+                sample_value = msg.sample;
+            } else {
+                sample_value = 0;
+            }
+        }
+
+        uint32_t start_time = time_us_32();
+
+        int32_t target;
+
+        if (fade_out_pos > 0) {
+            // Audio fade-out: ramp held audio level to silence
+            pdm_tail = pdm_head;  // drain ring buffer (Core 0 stopped pushing)
+            fade_out_pos--;
+            target = ((fade_base_pcm * (int32_t)fade_out_pos) >> PDM_FADE_IN_SHIFT) + 32768;
+
+            if (fade_out_pos == 0) {
+                // Fade-out complete — stop hardware
+                pio_sm_set_enabled(PDM_PIO, PDM_SM, false);
+                dma_channel_abort(pdm_dma_chan);
+                hw_running = false;
+                global_status.cpu1_load = 0;
+                continue;
+            }
+
+            // DMA throttle — no ring buffer pacing during fade
+            while (1) {
+                uint32_t ra = dma_hw->ch[pdm_dma_chan].read_addr;
+                uint32_t ri = (ra - (uint32_t)pdm_dma_buffer) / 4;
+                int32_t d = (local_pdm_write - ri) & (PDM_DMA_BUFFER_SIZE - 1);
+                if (d > (PDM_DMA_BUFFER_SIZE / 2)) {
+                    local_pdm_write = (ri + TARGET_LEAD) & (PDM_DMA_BUFFER_SIZE - 1);
+                    break;
+                }
+                if (d < TARGET_LEAD + 16) break;
+            }
+        } else {
+            // Normal operation (including audio fade-in)
+            // Input Hard Limiter
+            int32_t pcm_val = (sample_value >> 14);
+            if (pcm_val > PDM_CLIP_THRESH) pcm_val = PDM_CLIP_THRESH;
+            if (pcm_val < -PDM_CLIP_THRESH) pcm_val = -PDM_CLIP_THRESH;
+
+            // Audio fade-in
+            if (fade_in_pos < PDM_FADE_IN_SAMPLES) {
+                pcm_val = (pcm_val * (int32_t)fade_in_pos) >> PDM_FADE_IN_SHIFT;
+                fade_in_pos++;
+            }
+
+            fade_base_pcm = pcm_val;
+            target = pcm_val + 32768;
+        }
+
+        // 256x Oversampling with 2nd-order sigma-delta modulator
+        for (int chunk = 0; chunk < 8; chunk++) {
+            int32_t raw_rand = (int32_t)(fast_rand() & PDM_DITHER_MASK) - (PDM_DITHER_MASK >> 1);
+            int32_t dither = noise_shaped_dither(&ns, raw_rand, local_pdm_err2 >> 8);
+
+            uint32_t pdm_word = 0;
+            for (int k = 0; k < 32; k++) {
+                int32_t fb_val = ((local_pdm_err2 + dither) >= 0) ? 65535 : 0;
+                if ((local_pdm_err2 + dither) >= 0) pdm_word |= (1u << (31 - k));
+
+                local_pdm_err += (target - fb_val);
+                local_pdm_err2 += (local_pdm_err - fb_val);
+            }
+
+            pdm_dma_buffer[local_pdm_write] = pdm_word;
+            local_pdm_write = (local_pdm_write + 1) & (PDM_DMA_BUFFER_SIZE - 1);
+        }
+        pdm_stats_write_idx = local_pdm_write;
+
+        // Check for overrun after writing
+        {
+            uint32_t new_read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
+            uint32_t new_read_idx = (new_read_addr - (uint32_t)pdm_dma_buffer) / 4;
+            int32_t new_delta = (local_pdm_write - new_read_idx) & (PDM_DMA_BUFFER_SIZE - 1);
+            if (new_delta < 32) {
+                pdm_dma_overruns++;
+            }
+        }
+
+        // Leaky integrators
+        local_pdm_err  -= (local_pdm_err >> PDM_LEAKAGE_SHIFT);
+        local_pdm_err2 -= (local_pdm_err2 >> PDM_LEAKAGE_SHIFT);
+
+        uint32_t end_time = time_us_32();
+        active_us_accumulator += (end_time - start_time);
+        sample_counter++;
+
+        if (sample_counter >= 48) {
+            uint32_t inst_q8 = (active_us_accumulator * 26);  // ~25.6, +1.5% conservative
+            if (inst_q8 > 25600) inst_q8 = 25600;
+            pdm_load_q8 = pdm_load_q8 - (pdm_load_q8 >> 3) + (inst_q8 >> 3);
+            global_status.cpu1_load = (uint8_t)((pdm_load_q8 + 128) >> 8);
+            active_us_accumulator = 0;
+            sample_counter = 0;
+        }
+    }
+
+    // Exiting PDM mode — clean up hardware
+    if (hw_running) {
+        pio_sm_set_enabled(PDM_PIO, PDM_SM, false);
+        dma_channel_abort(pdm_dma_chan);
+        hw_running = false;
+    }
+    global_status.cpu1_load = 0;
+}
+
+// ----------------------------------------------------------------------------
+// EQ WORKER LOOP (RP2350 only — requires DCP and block-based EQ)
+// Processes EQ + gain for outputs CORE1_EQ_FIRST_OUTPUT..CORE1_EQ_LAST_OUTPUT
+// in parallel with Core 0 processing outputs 0-1
+// ----------------------------------------------------------------------------
+#if PICO_RP2350
+static void __not_in_flash_func(eq_worker_loop)() {
+    c1eq_load_q8 = 0;
+
+    while (core1_mode == CORE1_MODE_EQ_WORKER) {
+        // Wait for work from Core 0
+        while (!core1_eq_work.work_ready) {
+            if (core1_mode != CORE1_MODE_EQ_WORKER) return;
+            __wfe();
+        }
+        __dmb();
+
+        uint32_t work_start = time_us_32();
+
+        // Read work descriptor — vol_mul_start / vol_mul_step encode the
+        // shared per-sample ramp (see audio_pipeline.c).
+        float (*buf_out)[192] = core1_eq_work.buf_out;
+        uint32_t sample_count = core1_eq_work.sample_count;
+        float vol_mul_start = core1_eq_work.vol_mul_start;
+        float vol_mul_step  = core1_eq_work.vol_mul_step;
+        const LoudnessCoeffs *loud_coeffs =
+            (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
+        uint16_t loud_mask = core1_eq_work.loud_mask;
+        const PsybassCoeffs *pb_coeffs =
+            (const PsybassCoeffs *)core1_eq_work.psybass_coeffs;
+        uint16_t pb_mask = core1_eq_work.psybass_mask;
+
+        // Crossfeed for Core 1's pairs, pre-EQ (Core 0 owns pair 0; snapshot
+        // comes from core1_eq_work so both cores apply the same view).
+        crossfeed_process_pairs((const CrossfeedCoeffs *)core1_eq_work.xfeed_coeffs,
+                                core1_eq_work.xfeed_mask,
+                                CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
+                                buf_out, sample_count);
+
+        // Process EQ + gain for outputs assigned to Core 1
+        extern MatrixMixer matrix_mixer;
+        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
+                continue;
+            }
+
+            // Psychoacoustic bass on masked outputs, pre-crossover (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
+            }
+
+            // Output crossover + EQ
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
+                uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
+                if (!channel_bypassed[eq_ch]) {
+                    dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
+                }
+            }
+
+            // Combined gain + volume — per-sample linear ramp (step==0 in
+            // steady state falls back to the constant-gain path).
+            float matrix_gain = matrix_mixer.outputs[out].gain_linear;
+            float gain_start = matrix_mixer.outputs[out].mute ? 0.0f
+                               : matrix_gain * vol_mul_start;
+            float gain_step  = matrix_mixer.outputs[out].mute ? 0.0f
+                               : matrix_gain * vol_mul_step;
+            if (gain_step == 0.0f) {
+                if (gain_start == 0.0f) {
+                    memset(buf_out[out], 0, sample_count * sizeof(float));
+                } else if (gain_start != 1.0f) {
+                    float *dst = buf_out[out];
+                    for (uint32_t i = 0; i < sample_count; i++)
+                        dst[i] *= gain_start;
+                }
+            } else {
+                float *dst = buf_out[out];
+                float gain = gain_start;
+                for (uint32_t i = 0; i < sample_count; i++) {
+                    dst[i] *= gain;
+                    gain += gain_step;
+                }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0.0f && gain_step == 0.0f)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
+            }
+        }
+
+        // Delay for Core 1 outputs
+        if (any_delay_active) {
+            for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+                int32_t dly = channel_delay_samples[out];
+                if (dly <= 0) continue;
+                float *dst = buf_out[out];
+                float *dline = delay_lines[out];
+                uint32_t widx = core1_eq_work.delay_write_idx;
+                for (uint32_t i = 0; i < sample_count; i++) {
+                    dline[widx] = dst[i];
+                    dst[i] = dline[(widx - dly) & MAX_DELAY_MASK];
+                    widx = (widx + 1) & MAX_DELAY_MASK;
+                }
+            }
+        }
+
+        // Peak metering for Core 1 outputs
+        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+            float peak = 0;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                float a = fabsf(buf_out[out][i]);
+                if (a > peak) peak = a;
+            }
+            global_status.peaks[CH_OUT_1 + out] = (uint16_t)(fminf(1.0f, peak) * 32767.0f);
+            if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+        }
+
+        // Finalize Core 1's outputs (see output_s24.h), using Core 0's
+        // per-packet mode snapshot so both cores agree.  ADAT active:
+        // convert rows 2-7 to S24 in place, even with no slot buffer, so
+        // ADAT always sees converted samples; otherwise fuse
+        // convert+interleave per pair.  Then interleave pairs 1-3.
+        bool finalize_s24 = core1_eq_work.finalize_s24 != 0;
+        if (finalize_s24) {
+            for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++)
+                output_block_to_s24_inplace(buf_out[out], sample_count);
+        }
+        for (int p = 0; p < 3; p++) {
+            int32_t *out_ptr = core1_eq_work.spdif_out[p];
+            if (!out_ptr) continue;
+            int left_out = CORE1_EQ_FIRST_OUTPUT + p * 2;
+            int right_out = left_out + 1;
+            if (!matrix_mixer.outputs[left_out].enabled &&
+                !matrix_mixer.outputs[right_out].enabled) {
+                memset(out_ptr, 0, sample_count * 8);
+                continue;
+            }
+            if (finalize_s24)
+                output_pair_interleave_s24(out_ptr, buf_out[left_out],
+                                           buf_out[right_out], sample_count);
+            else
+                output_pair_convert_interleave(out_ptr, buf_out[left_out],
+                                               buf_out[right_out], sample_count);
+        }
+
+        uint32_t work_end = time_us_32();
+
+        // Budget-based CPU metering (same approach as Core 0)
+        {
+            uint32_t busy_us = work_end - work_start;
+            uint32_t budget_us = (uint32_t)((uint64_t)sample_count * 1000000u / audio_state.freq);
+            if (budget_us > 0) {
+                uint32_t inst_q8 = (busy_us * 25600) / budget_us;
+                if (inst_q8 > 25600) inst_q8 = 25600;
+                c1eq_load_q8 = c1eq_load_q8 - (c1eq_load_q8 >> 3) + (inst_q8 >> 3);
+            }
+            global_status.cpu1_load = (uint8_t)((c1eq_load_q8 + 128) >> 8);
+        }
+
+        // Signal completion to Core 0
+        core1_eq_work.work_ready = false;
+        __dmb();
+        core1_eq_work.work_done = true;
+        __sev();
+    }
+
+    global_status.cpu1_load = 0;
+}
+#else
+// ----------------------------------------------------------------------------
+// EQ WORKER LOOP (RP2040 — block-based Q28 fixed-point)
+// Processes EQ + gain + delay + SPDIF for outputs CORE1_EQ_FIRST_OUTPUT..CORE1_EQ_LAST_OUTPUT
+// in parallel with Core 0 processing outputs 0-1
+// ----------------------------------------------------------------------------
+static void __not_in_flash_func(eq_worker_loop)() {
+    c1eq_load_q8 = 0;
+
+    while (core1_mode == CORE1_MODE_EQ_WORKER) {
+        // Wait for work from Core 0
+        while (!core1_eq_work.work_ready) {
+            if (core1_mode != CORE1_MODE_EQ_WORKER) return;
+            __wfe();
+        }
+        __dmb();
+
+        uint32_t work_start = time_us_32();
+
+        // Read work descriptor — vol_mul_start / vol_mul_step encode the
+        // shared per-sample Q15 ramp (see audio_pipeline.c).
+        int32_t (*buf_out)[192] = core1_eq_work.buf_out;
+        uint32_t sample_count = core1_eq_work.sample_count;
+        int32_t vol_mul_start_q15 = core1_eq_work.vol_mul_start;
+        int32_t vol_mul_step_q15  = core1_eq_work.vol_mul_step;
+        const LoudnessCoeffs *loud_coeffs =
+            (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
+        uint16_t loud_mask = core1_eq_work.loud_mask;
+        const PsybassCoeffs *pb_coeffs =
+            (const PsybassCoeffs *)core1_eq_work.psybass_coeffs;
+        uint16_t pb_mask = core1_eq_work.psybass_mask;
+
+        // Crossfeed for Core 1's pair, pre-EQ (Core 0 owns pair 0; snapshot
+        // comes from core1_eq_work so both cores apply the same view).
+        crossfeed_process_pairs((const CrossfeedCoeffs *)core1_eq_work.xfeed_coeffs,
+                                core1_eq_work.xfeed_mask,
+                                CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
+                                buf_out, sample_count);
+
+        // Process EQ + gain for outputs assigned to Core 1
+        extern MatrixMixer matrix_mixer;
+        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
+                continue;
+            }
+
+            // Psychoacoustic bass on masked outputs, pre-crossover (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
+            }
+
+            // Output crossover + EQ (block-based)
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
+                uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
+                if (!channel_bypassed[eq_ch]) {
+                    dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
+                }
+            }
+
+            // Combined gain + volume (Q15) — per-sample ramp; step==0 falls
+            // back to constant-gain path.
+            float matrix_gain_f = matrix_mixer.outputs[out].gain_linear;
+            int32_t gain_start = matrix_mixer.outputs[out].mute ? 0
+                                 : (int32_t)(matrix_gain_f * (float)vol_mul_start_q15);
+            int32_t gain_step  = matrix_mixer.outputs[out].mute ? 0
+                                 : (int32_t)(matrix_gain_f * (float)vol_mul_step_q15);
+            if (gain_step == 0) {
+                if (gain_start == 0) {
+                    memset(buf_out[out], 0, sample_count * sizeof(int32_t));
+                } else {
+                    int32_t *dst = buf_out[out];
+                    for (uint32_t i = 0; i < sample_count; i++)
+                        dst[i] = fast_mul_q15(dst[i], gain_start);
+                }
+            } else {
+                int32_t *dst = buf_out[out];
+                int32_t gain = gain_start;
+                for (uint32_t i = 0; i < sample_count; i++) {
+                    dst[i] = fast_mul_q15(dst[i], gain);
+                    gain += gain_step;
+                }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0 && gain_step == 0)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
+            }
+        }
+
+        // Delay for Core 1 outputs
+        if (any_delay_active) {
+            for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+                int32_t dly = channel_delay_samples[out];
+                if (dly <= 0) continue;
+                int32_t *dst = buf_out[out];
+                int32_t *dline = delay_lines[out];
+                uint32_t widx = core1_eq_work.delay_write_idx;
+                for (uint32_t i = 0; i < sample_count; i++) {
+                    dline[widx] = dst[i];
+                    dst[i] = dline[(widx - dly) & MAX_DELAY_MASK];
+                    widx = (widx + 1) & MAX_DELAY_MASK;
+                }
+            }
+        }
+
+        // Peak metering for Core 1 outputs
+        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
+            int32_t peak = 0;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                int32_t a = abs(buf_out[out][i]);
+                if (a > peak) peak = a;
+            }
+            global_status.peaks[CH_OUT_1 + out] = (uint16_t)(peak >> 13);
+            if (peak > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+        }
+
+        // S/PDIF conversion for Core 1's pair (outputs 2-3 → int32 24-bit)
+        {
+            int32_t *out_ptr = core1_eq_work.spdif_out[0];
+            if (out_ptr) {
+                int left_out = CORE1_EQ_FIRST_OUTPUT;
+                int right_out = CORE1_EQ_FIRST_OUTPUT + 1;
+                if (!matrix_mixer.outputs[left_out].enabled &&
+                    !matrix_mixer.outputs[right_out].enabled) {
+                    memset(out_ptr, 0, sample_count * 8);
+                } else {
+                    for (uint32_t i = 0; i < sample_count; i++) {
+                        out_ptr[i*2]   = clip_s24((buf_out[left_out][i] + (1 << 5)) >> 6);
+                        out_ptr[i*2+1] = clip_s24((buf_out[right_out][i] + (1 << 5)) >> 6);
+                    }
+                }
+            }
+        }
+
+        uint32_t work_end = time_us_32();
+
+        // Budget-based CPU metering (same approach as Core 0)
+        {
+            uint32_t busy_us = work_end - work_start;
+            uint32_t budget_us = (uint32_t)((uint64_t)sample_count * 1000000u / audio_state.freq);
+            if (budget_us > 0) {
+                uint32_t inst_q8 = (busy_us * 25600) / budget_us;
+                if (inst_q8 > 25600) inst_q8 = 25600;
+                c1eq_load_q8 = c1eq_load_q8 - (c1eq_load_q8 >> 3) + (inst_q8 >> 3);
+            }
+            global_status.cpu1_load = (uint8_t)((c1eq_load_q8 + 128) >> 8);
+        }
+
+        // Signal completion to Core 0
+        core1_eq_work.work_ready = false;
+        __dmb();
+        core1_eq_work.work_done = true;
+        __sev();
+    }
+
+    global_status.cpu1_load = 0;
+}
+#endif
+
+// ----------------------------------------------------------------------------
+// BUFFER FILL LEVEL ACCESSORS (called from Core 0)
+// ----------------------------------------------------------------------------
+
+uint8_t __not_in_flash_func(pdm_get_dma_fill_pct)(void) {
+    if (!pdm_enabled || pdm_dma_chan < 0) return 0;
+    uint32_t write_idx = pdm_stats_write_idx;
+    uint32_t read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
+    uint32_t read_idx = (read_addr - (uint32_t)pdm_dma_buffer) / 4;
+    uint32_t delta = (write_idx - read_idx) & (PDM_DMA_BUFFER_SIZE - 1);
+    return (uint8_t)(delta * 100 / PDM_DMA_BUFFER_SIZE);
+}
+
+uint8_t __not_in_flash_func(pdm_get_ring_fill_pct)(void) {
+    uint8_t count = (uint8_t)(pdm_head - pdm_tail);
+    return (uint8_t)(count * 100 / RING_SIZE);
+}
+
+// ----------------------------------------------------------------------------
+// CORE 1 ENTRY — mode dispatcher
+// ----------------------------------------------------------------------------
+void __not_in_flash_func(pdm_core1_entry)() {
+#if PICO_RP2350
+    // Enable flush-to-zero and default-NaN on Core 1 (each core has its own FPSCR).
+    // Prevents denormal performance penalty in SVF/biquad state decay.
+    {
+        uint32_t fpscr;
+        __asm__ volatile("vmrs %0, fpscr" : "=r"(fpscr));
+        fpscr |= (1 << 24) | (1 << 25);  // FZ + DN bits
+        __asm__ volatile("vmsr fpscr, %0" : : "r"(fpscr));
+    }
+#endif
+
+    // Register as a lockout victim so Core 0 can safely park us in RAM
+    // during flash erase/program operations (XIP is quiesced).
+    multicore_lockout_victim_init();
+
+    while (1) {
+        switch (core1_mode) {
+            case CORE1_MODE_PDM:
+                pdm_processing_loop();
+                break;
+            case CORE1_MODE_EQ_WORKER:
+                eq_worker_loop();
+                break;
+            default:
+                global_status.cpu1_load = 0;
+                __wfe();
+                break;
+        }
+    }
+}
