@@ -37,6 +37,7 @@
 #include "usb_audio.h"
 #include "notify.h"
 #include "uart_control.h"
+#include "fx_control.h"
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "loudness.h"
@@ -1906,6 +1907,14 @@ void core0_init() {
     // notifications on real changes.
     notify_init();
 
+    // Dedicated FX-control UART (fixed 9600 8N1, fixed pins -- see
+    // fx_control.h). Unlike the interfaces below, this one has no persisted
+    // enable/pin config: it's always on, so it must claim its pins *before*
+    // the configurable interfaces below validate theirs -- otherwise a
+    // stored UART/I2C config that happened to pick the same pins would
+    // silently steal them instead of correctly failing validation.
+    fx_control_init();
+
     // External control interfaces (UART / I2C target).  Deliberately last:
     // after preset_boot_load() (persisted config available), after every
     // audio pin claim above (a stored control config whose pins now collide
@@ -1967,6 +1976,7 @@ int main(void) {
         // (bulk apply, flash) stays on the existing deferred paths below.
         uart_ctrl_poll();
         i2c_ctrl_poll();
+        fx_control_poll();
 
         // LG Sound Sync detection tick — internally throttled and
         // gated on (feature enabled && SPDIF input && SPDIF locked).
