@@ -12,14 +12,18 @@
  * Slot id 1 is intentionally left unassigned for now (see fx_control.h's
  * slot registry comment).
  *
- * Parameter mapping (see tempo_sync.h for the shared convention):
- *   param1  - time division, 1-16 (raw byte IS the step number directly,
- *             clamped at the edges via tempo_sync_step_from_raw()),
- *             converted to samples via tempo_sync_samples() against
- *             fx_control_get_bpm(). This is the length of BOTH the open
- *             and the muted half of the cycle -- step 1 (1/4 bar) means
- *             1/4 bar passes through, then 1/4 bar is silent, repeating
- *             (a full cycle is 2/4 bar).
+ * Parameter mapping (see tempo_sync.h for the two conventions it offers --
+ * this effect uses the sixteenth-note one, NOT the same one fx_delay uses):
+ *   param1  - time division, a direct count of sixteenth notes (1-255,
+ *             via tempo_sync_sixteenth_samples() against
+ *             fx_control_get_bpm()) -- param1=1 means 1/16 of a bar,
+ *             param1=16 means a full bar, param1=32 means 2 bars. This is
+ *             the length of BOTH the open and the muted half of the
+ *             cycle -- param1=1 means 1/16 bar passes through, then 1/16
+ *             bar is silent, repeating (a full cycle is 2/16 bar).
+ *             Finer resolution than fx_delay's 16-step scheme on purpose:
+ *             that scheme's shortest interval is a quarter note, too
+ *             coarse for a stutter gate.
  *   param2  - unused by this effect (reserved for future use).
  *   param3  - unused by this effect (reserved for future use).
  *   dry_wet - gate depth: 255 (fully wet) mutes the closed half completely

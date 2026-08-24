@@ -5,24 +5,38 @@
  * internal tempo (fx_control_get_bpm()) rather than a fixed millisecond
  * value, assuming a 4/4 bar.
  *
- * Convention shared by every tempo-synced effect's FxState (fx_control.h):
+ * param1's actual unit is effect-specific (see fx_control.h's slot
+ * registry and each effect's own header) -- this module offers two
+ * conventions effects can opt into, not one mandatory shared scheme:
  *
- *   param1 - time division, one of 16 steps:
- *                1-8  : straight quarter-note multiples of a bar
- *                       (1 = 1/4, 2 = 2/4, ... 8 = 8/4 == 2 bars)
- *                9-16 : the same 8 lengths again, as triplets
- *                       (9 = 1/4 triplet, ... 16 = 8/4 triplet)
- *              param1's raw byte value over the wire IS the step number
- *              directly (1-16); tempo_sync_step_from_raw() clamps it at
- *              the edges (0 -> 1, 17-255 -> 16) rather than mapping it.
+ *   tempo_sync_step_from_raw() / tempo_sync_ms() / tempo_sync_samples():
+ *     param1 is one of 16 steps:
+ *       1-8  : straight quarter-note multiples of a bar
+ *              (1 = 1/4, 2 = 2/4, ... 8 = 8/4 == 2 bars)
+ *       9-16 : the same 8 lengths again, as triplets
+ *              (9 = 1/4 triplet, ... 16 = 8/4 triplet)
+ *     param1's raw byte value over the wire IS the step number directly
+ *     (1-16); tempo_sync_step_from_raw() clamps it at the edges (0 -> 1,
+ *     17-255 -> 16) rather than mapping it. Used by fx_delay.
  *
- *   param2 - feedback, raw byte (0-255) scaled to 0.0-FX_FEEDBACK_MAX via
- *              fx_feedback_from_raw(). Capped below 1.0 so no effect can be
- *              parameterized into a runaway self-oscillating loop.
+ *     A triplet duration is 2/3 of the straight duration at the same step
+ *     number (n): fitting 3 notes in the space of 2 straight ones is the
+ *     standard "delay pedal triplet" convention.
  *
- * A triplet duration is 2/3 of the straight duration at the same step
- * number (n): fitting 3 notes in the space of 2 straight ones is the
- * standard "delay pedal triplet" convention.
+ *   tempo_sync_sixteenth_ms() / tempo_sync_sixteenth_samples():
+ *     param1 is a direct count of sixteenth notes (a 4/4 bar = 16
+ *     sixteenths = 4 quarters), NOT bucketed or stepped -- param1=1 means
+ *     1 sixteenth, param1=16 means a full bar, param1=32 means 2 bars,
+ *     and so on up to 255. No triplet variant. Used by fx_stutter, which
+ *     needed finer resolution than the 16-step scheme offers (its
+ *     shortest interval there would have been a quarter note, too coarse
+ *     for a stutter gate).
+ *
+ * param2 - feedback, raw byte (0-255) scaled to 0.0-FX_FEEDBACK_MAX via
+ *   fx_feedback_from_raw(). Capped below 1.0 so no effect can be
+ *   parameterized into a runaway self-oscillating loop. Used by fx_delay;
+ *   not a mandatory convention either -- see each effect's own header for
+ *   what param2/param3/dry_wet mean there.
  */
 
 #ifndef TEMPO_SYNC_H
@@ -45,6 +59,13 @@ uint32_t tempo_sync_samples(uint8_t step, uint16_t bpm_x100, uint32_t sample_rat
 
 // Convenience: raw param1 byte straight to samples.
 uint32_t tempo_sync_samples_from_raw(uint8_t raw, uint16_t bpm_x100, uint32_t sample_rate_hz);
+
+// Duration of n sixteenth notes (direct count, not stepped/bucketed) at
+// the given tempo. n < 1 is clamped up to 1 (no zero-length interval).
+float tempo_sync_sixteenth_ms(uint8_t n, uint16_t bpm_x100);
+
+// Same, in samples at the given sample rate (rounded to nearest).
+uint32_t tempo_sync_sixteenth_samples(uint8_t n, uint16_t bpm_x100, uint32_t sample_rate_hz);
 
 // Feedback param convention (param2): raw byte -> 0.0-FX_FEEDBACK_MAX float.
 #define FX_FEEDBACK_MAX 0.95f
