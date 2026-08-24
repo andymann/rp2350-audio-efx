@@ -38,6 +38,7 @@
 #include "notify.h"
 #include "uart_control.h"
 #include "fx_control.h"
+#include "fx_delay.h"
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "loudness.h"
@@ -1914,6 +1915,11 @@ void core0_init() {
     // stored UART/I2C config that happened to pick the same pins would
     // silently steal them instead of correctly failing validation.
     fx_control_init();
+
+    // Zero the FX delay line (slot 0) before the pipeline can process any
+    // audio through it. No pin/ordering constraints of its own -- just
+    // needs to happen before process_input_block() can run.
+    fx_delay_init();
 
     // External control interfaces (UART / I2C target).  Deliberately last:
     // after preset_boot_load() (persisted config available), after every

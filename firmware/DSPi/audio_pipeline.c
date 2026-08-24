@@ -26,6 +26,8 @@
 #include "adat_output.h"
 #include "output_s24.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
+#include "fx_control.h"
+#include "fx_delay.h"   // FX slot 0: tempo-synced delay on the main S/PDIF 1 pair
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
@@ -501,6 +503,13 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // slot still advances by the same sample_count (alignment preserved).
     if (siggen_running)
         siggen_render(buf_out, sample_count, sample_rate_hz);
+
+    // ========== PASS 4.7: FX chain (slot 0: tempo-synced delay) ==========
+    // Runs on the main S/PDIF 1 L/R pair, pre-crossfeed/EQ so the effect's
+    // wet signal gets the same downstream shaping as the dry path. See
+    // fx_delay.h for the parameter mapping and buffer-size cap. RP2350-only
+    // for now (this branch); not yet ported to the RP2040 int32 path below.
+    fx_delay_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
 
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
     // Slot finalization mode for THIS packet (see output_s24.h): in-place S24
