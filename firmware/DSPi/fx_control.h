@@ -23,17 +23,20 @@
  *
  *     As of the tempo-sync framework, every effect's param1 follows a
  *     shared time-division convention (see tempo_sync.h for the exact
- *     math): 1-16, raw byte bucketed into 16 steps; 1-8 are straight
- *     quarters of a 4/4 bar, 9-16 the same lengths as triplets. What
- *     param1's interval actually controls, and what param2/param3/dry_wet
- *     mean (if anything), are effect-specific -- see the slot registry
- *     below and each effect's own header.
+ *     math): param1's byte value IS the step number directly (1-16,
+ *     clamped at the edges); 1-8 are straight quarters of a 4/4 bar,
+ *     9-16 the same lengths as triplets. What param1's interval actually
+ *     controls, and what param2/param3/dry_wet mean (if anything), are
+ *     effect-specific -- see the slot registry below and each effect's
+ *     own header.
  *
  *     Slot registry (effect_num -> effect):
- *       0  fx_delay.c   - tempo-synced feedback delay. param2 = feedback.
+ *       0  fx_delay.c   - tempo-synced feedback delay. param2 = feedback,
+ *                         dry_wet = wet mix.
  *       1  (unassigned)
- *       2  fx_stutter.c - tempo-synced stutter/gate. param2/param3/dry_wet
- *                         unused.
+ *       2  fx_stutter.c - tempo-synced stutter/gate. dry_wet = gate depth
+ *                         (255 = full silence when muted, 0 = no gating
+ *                         effect at all). param2/param3 unused.
  *       3-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
  *     control plane doesn't know which slots have a DSP effect wired to

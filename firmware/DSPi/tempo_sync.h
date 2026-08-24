@@ -12,8 +12,9 @@
  *                       (1 = 1/4, 2 = 2/4, ... 8 = 8/4 == 2 bars)
  *                9-16 : the same 8 lengths again, as triplets
  *                       (9 = 1/4 triplet, ... 16 = 8/4 triplet)
- *              Arrives over the wire as a raw byte (0-255); bucket it into
- *              a step with tempo_sync_step_from_raw() first.
+ *              param1's raw byte value over the wire IS the step number
+ *              directly (1-16); tempo_sync_step_from_raw() clamps it at
+ *              the edges (0 -> 1, 17-255 -> 16) rather than mapping it.
  *
  *   param2 - feedback, raw byte (0-255) scaled to 0.0-FX_FEEDBACK_MAX via
  *              fx_feedback_from_raw(). Capped below 1.0 so no effect can be
@@ -31,7 +32,8 @@
 
 #define TEMPO_SYNC_STEPS 16
 
-// Bucket a raw 0-255 param byte into a 1-16 tempo-sync step.
+// Clamp param1's raw byte value into the 1-16 tempo-sync step range (the
+// byte value IS the step number directly; this just guards the edges).
 uint8_t tempo_sync_step_from_raw(uint8_t raw);
 
 // Duration of the given step (1-16) at the given tempo. bpm_x100 uses the

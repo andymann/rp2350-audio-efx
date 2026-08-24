@@ -8,10 +8,16 @@
 DSP_TIME_CRITICAL
 uint8_t tempo_sync_step_from_raw(uint8_t raw)
 {
-    // 256 raw values / 16 steps = 16 raw values per step, 1-indexed.
-    uint8_t step = (uint8_t)(raw >> 4) + 1;   // 0-15 -> 1-16
-    if (step > TEMPO_SYNC_STEPS) step = TEMPO_SYNC_STEPS;
-    return step;
+    // param1 IS the step number directly (1-16), clamped at the edges --
+    // not a raw 0-255 byte bucketed into 16 ranges. An earlier revision of
+    // this function did that bucketing ((raw >> 4) + 1), which meant
+    // param1 values 0x00-0x0F all mapped to step 1: confusing when setting
+    // param1 by hand over the FX UART, where sending literal 1, 2, 3...
+    // is the natural way to pick a step. 0 clamps up to step 1 (not an
+    // error -- there's no reason to refuse it) rather than down to 0.
+    if (raw < 1u) return 1u;
+    if (raw > TEMPO_SYNC_STEPS) return (uint8_t)TEMPO_SYNC_STEPS;
+    return raw;
 }
 
 DSP_TIME_CRITICAL

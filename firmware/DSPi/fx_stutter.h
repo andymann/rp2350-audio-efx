@@ -13,15 +13,20 @@
  * slot registry comment).
  *
  * Parameter mapping (see tempo_sync.h for the shared convention):
- *   param1  - time division, 1-16 steps (raw byte bucketed via
- *             tempo_sync_step_from_raw), converted to samples via
- *             tempo_sync_samples() against fx_control_get_bpm(). This is
- *             the length of BOTH the open and the muted half of the
- *             cycle -- step 1 (1/4 bar) means 1/4 bar passes through, then
- *             1/4 bar is silent, repeating (a full cycle is 2/4 bar).
+ *   param1  - time division, 1-16 (raw byte IS the step number directly,
+ *             clamped at the edges via tempo_sync_step_from_raw()),
+ *             converted to samples via tempo_sync_samples() against
+ *             fx_control_get_bpm(). This is the length of BOTH the open
+ *             and the muted half of the cycle -- step 1 (1/4 bar) means
+ *             1/4 bar passes through, then 1/4 bar is silent, repeating
+ *             (a full cycle is 2/4 bar).
  *   param2  - unused by this effect (reserved for future use).
  *   param3  - unused by this effect (reserved for future use).
- *   dry_wet - unused by this effect (reserved for future use).
+ *   dry_wet - gate depth: 255 (fully wet) mutes the closed half completely
+ *             (silence), 0 (fully dry) leaves it untouched (no gating
+ *             effect at all), values between are a partial attenuation.
+ *             The open half is always unaffected regardless of this
+ *             control.
  *
  * No PSRAM/buffer needed (unlike fx_delay): this is pure sample counting,
  * so there's no delay_buf-style hardware-availability guard to check.

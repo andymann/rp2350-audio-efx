@@ -42,10 +42,18 @@ void fx_stutter_process_block(float *out_l, float *out_r, uint32_t sample_count,
         cycle_pos = 0;
     }
 
+    // Gate depth: dry_wet=255 (fully wet) mutes completely, as before;
+    // dry_wet=0 (fully dry) leaves the muted half untouched (no gating
+    // effect at all); values between are a partial attenuation. Only the
+    // muted half is affected -- the open half always passes at full
+    // level regardless of this control, same as fx_delay's dry/wet only
+    // shaping its wet (delayed) contribution, not the source signal.
+    float mute_dry = 1.0f - ((float)st.dry_wet / 255.0f);
+
     for (uint32_t i = 0; i < sample_count; i++) {
         if (cycle_pos >= interval_samples) {
-            out_l[i] = 0.0f;
-            out_r[i] = 0.0f;
+            out_l[i] *= mute_dry;
+            out_r[i] *= mute_dry;
         }
         cycle_pos++;
         if (cycle_pos >= cycle_len) cycle_pos = 0;
