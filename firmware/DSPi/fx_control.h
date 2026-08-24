@@ -48,7 +48,14 @@
  *                         PHASER_RATE_TABLE). param2 = sweep depth
  *                         (0-255 scaled to 0.0-0.35). param3 unused.
  *                         dry_wet = wet mix.
- *       4-7 (unassigned)
+ *       4  fx_djfilter.c - DJ-style sweep filter (LP below center, HP
+ *                         above). param1 = cutoff/mode, 0-255 (127 =
+ *                         exact bypass, 0..126 = low-pass sweeping
+ *                         logarithmically closed, 128..255 = high-pass
+ *                         sweeping logarithmically closed). param2 =
+ *                         resonance/Q (0.707-8.0). param3 unused.
+ *                         dry_wet = wet mix.
+ *       5-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
  *     control plane doesn't know which slots have a DSP effect wired to
  *     them), it just has nothing reading it yet -- same situation slot 0
