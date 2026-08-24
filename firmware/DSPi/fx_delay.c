@@ -5,9 +5,10 @@
 #include "fx_delay.h"
 #include "fx_control.h"
 #include "tempo_sync.h"
+#include "pico/platform/sections.h"   // __uninitialized_psram()
 #include <string.h>
 
-static int16_t delay_buf[FX_DELAY_MAX_SAMPLES];
+static int16_t __uninitialized_psram("fx_delay") delay_buf[FX_DELAY_MAX_SAMPLES];
 static uint32_t write_idx = 0;
 
 void fx_delay_init(void)

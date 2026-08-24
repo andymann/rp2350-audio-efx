@@ -16,19 +16,27 @@
  *   dry_wet - standard FxState field (0-255), used as the wet mix amount.
  *   param3  - unused by this effect.
  *
- * BUFFER SIZE CAP: the delay line is a fixed-size int16 SRAM buffer, not
- * PSRAM (this repo has no PSRAM driver/linker region set up yet -- see the
- * RP2350 reverb work in an earlier session for what that involves). At
- * build time this firmware has ~80KB of SRAM free after everything else
- * (memmap_dspi_rp2350_xip.ld: 512KB RAM total); FX_DELAY_MAX_SAMPLES is
- * sized to fit comfortably inside that with headroom for stack/heap.
+ * BUFFER: lives in the board's 8MB QSPI PSRAM (__uninitialized_psram(),
+ * see memmap_dspi_rp2350_xip.ld's .psram_noload section and
+ * boards/rp2350b_audio_efx.h's PICO_PSRAM_SIZE_BYTES/PICO_PSRAM_CS_PIN),
+ * not the on-chip SRAM an earlier revision of this file used -- SRAM was
+ * too tight (~80KB free) to cover the full 16-step tempo_sync range at
+ * musically reasonable tempos.
  *
- * A requested delay (time division x BPM) longer than the cap is silently
- * CLAMPED to the cap rather than refused, so the effect is always audible,
- * just shorter than the musical value at slow tempi / long divisions. At
- * 48kHz the cap is ~600ms; it halves at 96kHz since the cap is fixed in
- * samples, not milliseconds. Moving this to a PSRAM-backed buffer would
- * remove the cap.
+ * FX_DELAY_MAX_SAMPLES is sized for the slowest tempo this module treats as
+ * "practical" (see FX_DELAY_MIN_PRACTICAL_BPM) at the longest step (16:
+ * 8-bar-equivalent triplet). Slower than that gets clamped rather than
+ * refused, same policy as before, just a far more generous ceiling: at
+ * 48kHz the cap is now measured in seconds, not milliseconds, and halves at
+ * 96kHz since it is fixed in samples.
+ *
+ * PSRAM clock is capped at 100MHz (firmware/CMakeLists.txt,
+ * PICO_DEFAULT_PSRAM_MAX_FREQ) rather than the SDK's 133MHz default -- an
+ * earlier session's attempt to use this board's PSRAM (different driver,
+ * before hardware_psram existed in the pinned SDK) hit audible write
+ * corruption at 133MHz that cleared up at 100MHz. Treated as a
+ * board/wiring signal worth respecting here too until re-validated on
+ * real hardware.
  */
 
 #ifndef FX_DELAY_H
@@ -36,12 +44,21 @@
 
 #include <stdint.h>
 
-// Fixed in samples (not ms) so the cap is sample-rate-independent code-wise;
-// the time it represents shrinks at higher sample rates. 28800 samples =
-// 600ms @ 48kHz / 300ms @ 96kHz. int16 mono: 28800 * 2 bytes = 56.25KB.
-#define FX_DELAY_MAX_SAMPLES 28800u
+// The slowest BPM this module sizes its buffer for. Below this, a request
+// for the longest step (16) gets clamped to the buffer cap instead of
+// getting the full musical length. 20 BPM is already an unusually slow
+// tempo for a delay to be tracking; going lower is rare enough to accept
+// the clamp rather than spend PSRAM on it.
+#define FX_DELAY_MIN_PRACTICAL_BPM 20u
 
-// Zero the delay buffer. Call once at boot before the pipeline starts.
+// 8 quarters (step 8) * 2/3 (triplet, step 16) at 20 BPM (quarter = 3000ms
+// @ 20 BPM) = 16000ms = 16s @ 48kHz -> 768000 samples. int16 mono:
+// 768000 * 2 bytes = 1.5MB (comfortably inside the 8MB PSRAM budget).
+#define FX_DELAY_MAX_SAMPLES 768000u
+
+// Zero the delay buffer. Call once at boot, after PSRAM is up (i.e.
+// anywhere in main() -- runtime_init brings PSRAM up before main() runs)
+// and before the pipeline starts.
 void fx_delay_init(void);
 
 // Process sample_count samples of the main stereo pair in place. Reads
@@ -51,3 +68,4 @@ void fx_delay_process_block(float *out_l, float *out_r, uint32_t sample_count,
                              uint32_t sample_rate_hz);
 
 #endif // FX_DELAY_H
+

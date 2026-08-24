@@ -20,6 +20,17 @@ add_compile_definitions(PICO_FLASH_SPI_CLKDIV=6)
 # XIP setup (CLKDIV≈3) stays in force.  The RP2350 override is done at runtime
 # in DSPi/flash_clkdiv.c by writing QMI registers directly.
 
+# PSRAM clock: cap below the SDK's 133MHz default. An earlier attempt to use
+# this board's PSRAM (a different, pre-hardware_psram driver, in an earlier
+# session) produced audible write-corruption noise at 133MHz that cleared up
+# at 100MHz -- treat that as a hardware/board-layout signal for THIS board
+# and start conservative here too, rather than re-discovering it on real
+# hardware. Re-validate and raise if the actual PSRAM chip/wiring supports
+# more once you can test on the board. (Plain literal, not `100*MHZ`: CMake
+# silently drops command-line defines whose value starts with '(' as
+# function-like-macro syntax.)
+add_compile_definitions(PICO_DEFAULT_PSRAM_MAX_FREQ=100000000)
+
 # Pull in PICO SDK (must be before project)
 include(pico_sdk_import.cmake)
 
