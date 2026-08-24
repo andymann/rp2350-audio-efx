@@ -282,6 +282,14 @@ void fx_control_init(void) {
     fx_state[3].param1 = 0x06u;
     fx_state[3].param2 = 0xC0u;
 
+    // Slot 4 (fx_djfilter.c, FX_DJFILTER_EFFECT_NUM) similarly ships with
+    // non-zero defaults: param1=0x7F (127, exact bypass -- the filter
+    // does nothing until explicitly swept away from center) and
+    // param2=0x40 (mild resonance, well below the 0xC0-ish territory
+    // where a DJ filter starts sounding aggressive/resonant-peaky).
+    fx_state[4].param1 = 0x7Fu;
+    fx_state[4].param2 = 0x40u;
+
     bpm_x100 = BPM_X100_DEFAULT;
     reset_parser();
     rx_head = 0;
