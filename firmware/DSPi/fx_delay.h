@@ -30,15 +30,20 @@
  * 48kHz the cap is now measured in seconds, not milliseconds, and halves at
  * 96kHz since it is fixed in samples.
  *
- * PSRAM clock is capped at 66MHz (firmware/CMakeLists.txt,
+ * PSRAM clock is capped at 40MHz (firmware/CMakeLists.txt,
  * PICO_DEFAULT_PSRAM_MAX_FREQ) rather than the SDK's 133MHz default. An
  * earlier session's attempt to use this board's PSRAM (different driver,
  * before hardware_psram existed in the pinned SDK) hit audible write
  * corruption at 133MHz, then again at 100MHz (that time only at the delay
- * buffer's first wraparound), and only became reliable at 66MHz -- this
- * board+PSRAM-chip combination (RP2350B + AP6404L-class) has public reports
- * of needing a hand-tuned, lower divisor. Re-validate on real hardware
- * before raising it.
+ * buffer's first wraparound), and became reliable at 66MHz THERE -- but on
+ * this build, noise persisted at 66MHz even after confirming (onboard LED /
+ * fx_delay_psram_ok()) that PSRAM is correctly detected and mapped, ruling
+ * out wiring and narrowing it to clock/timing margin specifically. Lowered
+ * to 40MHz on that basis. This board+PSRAM-chip combination (RP2350B +
+ * AP6404L-class) has public reports of needing a hand-tuned, lower
+ * divisor; if noise persists at 40MHz too, see firmware/CMakeLists.txt's
+ * comment for the next steps (lower further, then hardware/psram.h's
+ * psram_set_params() for manual divisor/rxdelay tuning).
  *
  * fx_delay_process_block() (and the fx_control_get() / fx_control_get_bpm() /
  * tempo_sync_ family / fx_feedback_from_raw() call chain it uses) is
