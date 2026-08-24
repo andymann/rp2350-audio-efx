@@ -5,6 +5,7 @@
 #include "fx_delay.h"
 #include "fx_control.h"
 #include "tempo_sync.h"
+#include "config.h"                   // DSP_TIME_CRITICAL
 #include "pico/platform/sections.h"   // __uninitialized_psram()
 #include <string.h>
 
@@ -17,6 +18,18 @@ void fx_delay_init(void)
     write_idx = 0;
 }
 
+// RAM-resident (not just RP2350's -O3 DSP-hot-file convention): on RP2350,
+// PSRAM and flash share the same physical QMI bus (different chip
+// selects). If this function's own *code* stayed in flash and ran via the
+// XIP cache, its instruction fetches would compete with the PSRAM *data*
+// traffic this function is doing every sample -- an earlier session hit
+// exactly this as one half of a two-part cause of audible noise on real
+// RP2350B+PSRAM hardware (the other half was too-fast a PSRAM clock; see
+// firmware/CMakeLists.txt's PICO_DEFAULT_PSRAM_MAX_FREQ comment). The
+// whole call chain from here down (fx_control_get/fx_control_get_bpm,
+// tempo_sync_*, fx_feedback_from_raw) is marked DSP_TIME_CRITICAL for the
+// same reason -- any link still fetching from flash reintroduces the race.
+DSP_TIME_CRITICAL
 void fx_delay_process_block(float *out_l, float *out_r, uint32_t sample_count,
                              uint32_t sample_rate_hz)
 {

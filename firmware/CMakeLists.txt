@@ -20,16 +20,22 @@ add_compile_definitions(PICO_FLASH_SPI_CLKDIV=6)
 # XIP setup (CLKDIV≈3) stays in force.  The RP2350 override is done at runtime
 # in DSPi/flash_clkdiv.c by writing QMI registers directly.
 
-# PSRAM clock: cap below the SDK's 133MHz default. An earlier attempt to use
-# this board's PSRAM (a different, pre-hardware_psram driver, in an earlier
-# session) produced audible write-corruption noise at 133MHz that cleared up
-# at 100MHz -- treat that as a hardware/board-layout signal for THIS board
-# and start conservative here too, rather than re-discovering it on real
-# hardware. Re-validate and raise if the actual PSRAM chip/wiring supports
-# more once you can test on the board. (Plain literal, not `100*MHZ`: CMake
-# silently drops command-line defines whose value starts with '(' as
-# function-like-macro syntax.)
-add_compile_definitions(PICO_DEFAULT_PSRAM_MAX_FREQ=100000000)
+# PSRAM clock: cap below the SDK's 133MHz default. This exact board/chip
+# combination (RP2350B + AP6404L-class PSRAM) has hit audible corruption
+# noise on real hardware before -- an earlier session's PSRAM-backed effect
+# was noisy at the 133MHz default, then AGAIN at 100MHz (that time delayed
+# until the delay buffer's first wraparound -- a periodic, tonal-sounding
+# glitch, matching what "high-pitched noise instead of a delay" sounds
+# like), and only became reliable at 66MHz. Start there rather than
+# re-walking that same 133 -> 100 -> 66 discovery path. If it's still not
+# clean at 66MHz, see hardware/psram.h's psram_set_params() for manually
+# setting divisor/rxdelay/select timing rather than trusting
+# psram_configure_params()'s auto-calculation at any frequency -- that
+# earlier session's notes flag this board/PSRAM-chip pairing as having
+# public reports of needing hand-tuned timing. (Plain literal, not
+# `66*MHZ`: CMake silently drops command-line defines whose value starts
+# with '(' as function-like-macro syntax.)
+add_compile_definitions(PICO_DEFAULT_PSRAM_MAX_FREQ=66000000)
 
 # Pull in PICO SDK (must be before project)
 include(pico_sdk_import.cmake)

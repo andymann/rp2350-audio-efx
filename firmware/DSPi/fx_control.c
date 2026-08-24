@@ -327,12 +327,19 @@ bool fx_control_owns_pin(uint8_t pin) {
     return g_is_live && (pin == FX_UART_TX_PIN || pin == FX_UART_RX_PIN);
 }
 
+// Called every audio block from fx_delay_process_block() (RP2350: the whole
+// call chain from there down needs to stay RAM-resident -- PSRAM and flash
+// share the same physical QMI bus on this chip, so any link in that chain
+// still executing from flash via XIP competes with the PSRAM data traffic
+// the effect itself is doing. See fx_delay.c's history comment.
+DSP_TIME_CRITICAL
 bool fx_control_get(uint8_t effect_num, FxState *out) {
     if (effect_num >= FX_CONTROL_NUM_EFFECTS || !out) return false;
     *out = fx_state[effect_num];
     return true;
 }
 
+DSP_TIME_CRITICAL
 uint16_t fx_control_get_bpm(void) {
     return bpm_x100;
 }

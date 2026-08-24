@@ -30,13 +30,23 @@
  * 48kHz the cap is now measured in seconds, not milliseconds, and halves at
  * 96kHz since it is fixed in samples.
  *
- * PSRAM clock is capped at 100MHz (firmware/CMakeLists.txt,
- * PICO_DEFAULT_PSRAM_MAX_FREQ) rather than the SDK's 133MHz default -- an
+ * PSRAM clock is capped at 66MHz (firmware/CMakeLists.txt,
+ * PICO_DEFAULT_PSRAM_MAX_FREQ) rather than the SDK's 133MHz default. An
  * earlier session's attempt to use this board's PSRAM (different driver,
  * before hardware_psram existed in the pinned SDK) hit audible write
- * corruption at 133MHz that cleared up at 100MHz. Treated as a
- * board/wiring signal worth respecting here too until re-validated on
- * real hardware.
+ * corruption at 133MHz, then again at 100MHz (that time only at the delay
+ * buffer's first wraparound), and only became reliable at 66MHz -- this
+ * board+PSRAM-chip combination (RP2350B + AP6404L-class) has public reports
+ * of needing a hand-tuned, lower divisor. Re-validate on real hardware
+ * before raising it.
+ *
+ * fx_delay_process_block() (and the fx_control_get() / fx_control_get_bpm() /
+ * tempo_sync_ family / fx_feedback_from_raw() call chain it uses) is
+ * RAM-resident (DSP_TIME_CRITICAL), not just flagged for -O3: on RP2350,
+ * PSRAM and flash share the same physical QMI bus, so code that stayed in
+ * flash would have its instruction fetches compete with this function's
+ * own PSRAM data traffic -- the other half of that earlier session's
+ * noise, alongside the clock speed.
  */
 
 #ifndef FX_DELAY_H
