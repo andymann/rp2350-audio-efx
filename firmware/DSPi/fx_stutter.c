@@ -30,7 +30,8 @@ void fx_stutter_process_block(float *out_l, float *out_r, uint32_t sample_count,
     }
 
     uint16_t bpm_x100 = fx_control_get_bpm();
-    uint32_t interval_samples = tempo_sync_sixteenth_samples(st.param1, bpm_x100, sample_rate_hz);
+    uint32_t interval_samples = tempo_sync_bar_fraction_samples(
+        st.param1, FX_STUTTER_SUBDIVISIONS_PER_BAR, bpm_x100, sample_rate_hz);
     if (interval_samples < 1u) interval_samples = 1u;
 
     uint32_t cycle_len = interval_samples * 2u;

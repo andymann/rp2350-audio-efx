@@ -23,14 +23,18 @@
  *     number (n): fitting 3 notes in the space of 2 straight ones is the
  *     standard "delay pedal triplet" convention.
  *
- *   tempo_sync_sixteenth_ms() / tempo_sync_sixteenth_samples():
- *     param1 is a direct count of sixteenth notes (a 4/4 bar = 16
- *     sixteenths = 4 quarters), NOT bucketed or stepped -- param1=1 means
- *     1 sixteenth, param1=16 means a full bar, param1=32 means 2 bars,
- *     and so on up to 255. No triplet variant. Used by fx_stutter, which
- *     needed finer resolution than the 16-step scheme offers (its
- *     shortest interval there would have been a quarter note, too coarse
- *     for a stutter gate).
+ *   tempo_sync_bar_fraction_ms() / tempo_sync_bar_fraction_samples():
+ *     param1 is a direct count of 1/subdivisions_per_bar-note units (the
+ *     caller picks subdivisions_per_bar -- 16 for sixteenth notes, 32 for
+ *     32nd notes, etc.), NOT bucketed or stepped -- param1=1 means one
+ *     such unit, param1=subdivisions_per_bar means a full bar, and so on
+ *     up to 255. No triplet variant. Used by fx_stutter, which needed
+ *     finer resolution than the 16-step scheme offers (its shortest
+ *     interval there is a quarter note); the exact subdivision fx_stutter
+ *     uses is its own choice, see FX_STUTTER_SUBDIVISIONS_PER_BAR in
+ *     fx_stutter.h -- changing it there doesn't require touching this
+ *     file, precisely so another "make it finer" request doesn't need a
+ *     new tempo_sync function each time.
  *
  * param2 - feedback, raw byte (0-255) scaled to 0.0-FX_FEEDBACK_MAX via
  *   fx_feedback_from_raw(). Capped below 1.0 so no effect can be
@@ -60,12 +64,16 @@ uint32_t tempo_sync_samples(uint8_t step, uint16_t bpm_x100, uint32_t sample_rat
 // Convenience: raw param1 byte straight to samples.
 uint32_t tempo_sync_samples_from_raw(uint8_t raw, uint16_t bpm_x100, uint32_t sample_rate_hz);
 
-// Duration of n sixteenth notes (direct count, not stepped/bucketed) at
-// the given tempo. n < 1 is clamped up to 1 (no zero-length interval).
-float tempo_sync_sixteenth_ms(uint8_t n, uint16_t bpm_x100);
+// Duration of n subdivisions-per-bar units (direct count, not
+// stepped/bucketed) at the given tempo. n < 1 is clamped up to 1 (no
+// zero-length interval). subdivisions_per_bar is how many equal parts a
+// 4/4 bar is cut into (16 = sixteenth notes, 32 = 32nd notes, ...); < 1
+// is clamped up to 1 (one giant "unit" spanning the whole bar).
+float tempo_sync_bar_fraction_ms(uint8_t n, uint16_t subdivisions_per_bar, uint16_t bpm_x100);
 
 // Same, in samples at the given sample rate (rounded to nearest).
-uint32_t tempo_sync_sixteenth_samples(uint8_t n, uint16_t bpm_x100, uint32_t sample_rate_hz);
+uint32_t tempo_sync_bar_fraction_samples(uint8_t n, uint16_t subdivisions_per_bar,
+                                          uint16_t bpm_x100, uint32_t sample_rate_hz);
 
 // Feedback param convention (param2): raw byte -> 0.0-FX_FEEDBACK_MAX float.
 #define FX_FEEDBACK_MAX 0.95f

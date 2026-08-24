@@ -53,22 +53,23 @@ uint32_t tempo_sync_samples_from_raw(uint8_t raw, uint16_t bpm_x100, uint32_t sa
 }
 
 DSP_TIME_CRITICAL
-float tempo_sync_sixteenth_ms(uint8_t n, uint16_t bpm_x100)
+float tempo_sync_bar_fraction_ms(uint8_t n, uint16_t subdivisions_per_bar, uint16_t bpm_x100)
 {
     if (n < 1u) n = 1u;   // guard a zero-length interval, same policy as tempo_sync_ms's step clamp
+    if (subdivisions_per_bar < 1u) subdivisions_per_bar = 1u;
     if (bpm_x100 == 0) bpm_x100 = 1;   // guard div-by-zero from a bad Set BPM value
 
-    float bpm         = bpm_x100 / 100.0f;
-    float quarter_ms  = 60000.0f / bpm;
-    float sixteenth_ms = quarter_ms / 4.0f;   // 4/4 bar = 16 sixteenths = 4 quarters
+    float bpm    = bpm_x100 / 100.0f;
+    float bar_ms = (60000.0f / bpm) * 4.0f;   // 4/4 bar = 4 quarters
 
-    return n * sixteenth_ms;
+    return n * (bar_ms / (float)subdivisions_per_bar);
 }
 
 DSP_TIME_CRITICAL
-uint32_t tempo_sync_sixteenth_samples(uint8_t n, uint16_t bpm_x100, uint32_t sample_rate_hz)
+uint32_t tempo_sync_bar_fraction_samples(uint8_t n, uint16_t subdivisions_per_bar,
+                                          uint16_t bpm_x100, uint32_t sample_rate_hz)
 {
-    float ms = tempo_sync_sixteenth_ms(n, bpm_x100);
+    float ms = tempo_sync_bar_fraction_ms(n, subdivisions_per_bar, bpm_x100);
     return (uint32_t)(ms * (float)sample_rate_hz / 1000.0f + 0.5f);
 }
 

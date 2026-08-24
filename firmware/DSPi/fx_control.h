@@ -34,11 +34,13 @@
  *                         dry_wet = wet mix.
  *       1  (unassigned)
  *       2  fx_stutter.c - tempo-synced stutter/gate. param1 = direct count
- *                         of sixteenth notes, 1-255 (finer resolution than
- *                         fx_delay's scheme; see tempo_sync.h's
- *                         tempo_sync_sixteenth_samples()). dry_wet = gate
- *                         depth (255 = full silence when muted, 0 = no
- *                         gating effect at all). param2/param3 unused.
+ *                         of 32nd notes, 1-255 (see fx_stutter.h's
+ *                         FX_STUTTER_SUBDIVISIONS_PER_BAR; finer
+ *                         resolution than fx_delay's scheme via
+ *                         tempo_sync.h's generic
+ *                         tempo_sync_bar_fraction_samples()). dry_wet =
+ *                         gate depth (255 = full silence when muted, 0 =
+ *                         no gating effect at all). param2/param3 unused.
  *       3-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
  *     control plane doesn't know which slots have a DSP effect wired to
