@@ -66,6 +66,8 @@ add_executable(DSPi
     siggen.h
     spdif_input.c
     spdif_input.h
+    tempo_sync.c
+    tempo_sync.h
     uart_control.c
     uart_control.h
     upmix.c

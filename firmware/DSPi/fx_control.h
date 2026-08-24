@@ -21,6 +21,14 @@
  *     A frame with effect_num > 7 or on_off > 1 is dropped: no echo, no
  *     state change.
  *
+ *     As of the tempo-sync framework, every effect's time-based behavior
+ *     follows a shared convention (see tempo_sync.h for the exact math):
+ *       param1 = time division, 1-16 (raw byte bucketed into 16 steps;
+ *                1-8 straight quarters of a 4/4 bar, 9-16 the same
+ *                lengths as triplets)
+ *       param2 = feedback, raw byte scaled to 0.0-FX_FEEDBACK_MAX
+ *     param3 and dry_wet remain effect-specific / general purpose.
+ *
  *   Query FX      (0x02, 2 bytes total):
  *     0x02, effect_num[0-7]
  *     Response is 7 bytes, laid out exactly like a Set FX command (leading
