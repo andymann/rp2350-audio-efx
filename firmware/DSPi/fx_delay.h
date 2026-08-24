@@ -53,6 +53,7 @@
 #define FX_DELAY_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // The slowest BPM this module sizes its buffer for. Below this, a request
 // for the longest step (16) gets clamped to the buffer cap instead of
@@ -70,6 +71,13 @@
 // anywhere in main() -- runtime_init brings PSRAM up before main() runs)
 // and before the pipeline starts.
 void fx_delay_init(void);
+
+// True iff fx_delay_init() confirmed delay_buf's PSRAM address range is
+// actually mapped (psram_is_available() + psram_check_address()), false if
+// PSRAM auto-detection didn't find a chip on any candidate CS pin. main.c
+// uses this to drive the onboard LED as a physical go/no-go signal for
+// PSRAM bring-up, separate from (and available before) any UART traffic.
+bool fx_delay_psram_ok(void);
 
 // Process sample_count samples of the main stereo pair in place. Reads
 // effect slot 0's state via fx_control_get(0, ...); no-op (passthrough) if

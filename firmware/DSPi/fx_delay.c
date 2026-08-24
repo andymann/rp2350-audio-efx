@@ -7,15 +7,38 @@
 #include "tempo_sync.h"
 #include "config.h"                   // DSP_TIME_CRITICAL
 #include "pico/platform/sections.h"   // __uninitialized_psram()
+#include "hardware/psram.h"           // psram_is_available(), psram_check_address()
 #include <string.h>
+#include <stdbool.h>
 
 static int16_t __uninitialized_psram("fx_delay") delay_buf[FX_DELAY_MAX_SAMPLES];
 static uint32_t write_idx = 0;
 
+// Set once in fx_delay_init() after actually confirming the delay_buf
+// address range is backed by real PSRAM (not just assumed at compile
+// time). If PSRAM auto-detection (boards/rp2350b_audio_efx.h,
+// PICO_AUTO_DETECT_PSRAM) doesn't find a chip on any candidate CS pin,
+// hardware_psram disables that address region's QMI mapping entirely --
+// touching it would then hard-fault instead of just sounding wrong.
+// Checking this before every access turns "wrong/missing PSRAM wiring"
+// into a silent no-op effect (diagnosable: slot 0 does nothing at all)
+// instead of a crash.
+static bool psram_ok = false;
+
 void fx_delay_init(void)
 {
+    psram_ok = psram_is_available() &&
+               psram_check_address(&delay_buf[FX_DELAY_MAX_SAMPLES - 1]);
+    if (!psram_ok) {
+        return;   // do not touch delay_buf at all -- see psram_ok's comment
+    }
     memset(delay_buf, 0, sizeof(delay_buf));
     write_idx = 0;
+}
+
+bool fx_delay_psram_ok(void)
+{
+    return psram_ok;
 }
 
 // RAM-resident (not just RP2350's -O3 DSP-hot-file convention): on RP2350,
@@ -33,6 +56,10 @@ DSP_TIME_CRITICAL
 void fx_delay_process_block(float *out_l, float *out_r, uint32_t sample_count,
                              uint32_t sample_rate_hz)
 {
+    if (!psram_ok) {
+        return;   // PSRAM not confirmed present/mapped -- see psram_ok's comment
+    }
+
     FxState st;
     if (!fx_control_get(0, &st) || !st.enabled) {
         return;   // slot 0 off or unavailable: passthrough, buffer keeps aging silently

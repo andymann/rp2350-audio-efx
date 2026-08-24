@@ -1921,6 +1921,17 @@ void core0_init() {
     // needs to happen before process_input_block() can run.
     fx_delay_init();
 
+    // Onboard LED as a physical PSRAM go/no-go signal: solid on if
+    // fx_delay_init() confirmed PSRAM is actually mapped, off if
+    // auto-detection didn't find a chip on any candidate CS pin. Available
+    // immediately at boot, independent of the UART -- useful for telling
+    // "PSRAM not found at all" (LED off, would previously have been a
+    // silent bus fault on first use) apart from "PSRAM found but noisy"
+    // (LED on, points back at clock/timing instead of wiring).
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, fx_delay_psram_ok());
+
     // External control interfaces (UART / I2C target).  Deliberately last:
     // after preset_boot_load() (persisted config available), after every
     // audio pin claim above (a stored control config whose pins now collide
