@@ -28,6 +28,7 @@
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "fx_control.h"
 #include "fx_delay.h"   // FX slot 0: tempo-synced delay on the main S/PDIF 1 pair
+#include "fx_stutter.h" // FX slot 2: tempo-synced stutter/gate, chained after slot 0
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
@@ -510,6 +511,12 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // fx_delay.h for the parameter mapping and buffer-size cap. RP2350-only
     // for now (this branch); not yet ported to the RP2040 int32 path below.
     fx_delay_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
+
+    // Slot 2 (stutter) chained right after slot 0 (delay) so effects run
+    // in ascending effect_num order -- gates the delay's wet trail too,
+    // not just the dry signal. See fx_stutter.h. Slot 1 intentionally
+    // unassigned; see fx_control.h's slot registry comment.
+    fx_stutter_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
 
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
     // Slot finalization mode for THIS packet (see output_s24.h): in-place S24

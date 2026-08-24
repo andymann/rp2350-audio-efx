@@ -39,6 +39,7 @@
 #include "uart_control.h"
 #include "fx_control.h"
 #include "fx_delay.h"
+#include "fx_stutter.h"
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "loudness.h"
@@ -1920,6 +1921,11 @@ void core0_init() {
     // audio through it. No pin/ordering constraints of its own -- just
     // needs to happen before process_input_block() can run.
     fx_delay_init();
+
+    // Reset FX stutter phase (slot 2). Same ordering requirement as
+    // fx_delay_init() above: no pins to claim, just needs to run before
+    // the pipeline starts.
+    fx_stutter_init();
 
     // Onboard LED as a physical PSRAM go/no-go signal: solid on if
     // fx_delay_init() confirmed PSRAM is actually mapped, off if
