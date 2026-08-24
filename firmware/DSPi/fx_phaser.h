@@ -49,8 +49,16 @@
  *             deep the sweep goes, dry_wet controls how much of the
  *             swept (wet) signal is heard at all.
  *   param3  - unused (reserved for future use, per spec).
- *   dry_wet - wet mix, same convention as fx_delay: 0 = fully dry (no
- *             audible effect), 255 = fully wet (only the phased signal).
+ *   dry_wet - wet mix: 0 = fully dry (no audible effect), 255 = fully wet
+ *             (only the "wet bus" -- see below -- is heard). NOT the same
+ *             convention as fx_delay's dry_wet, which blends dry against
+ *             the raw delayed signal: here the internal wet bus is
+ *             already input+allpass summed (0.5*(in + allpass_cascade(in))),
+ *             because that summation, not the allpass output alone, is
+ *             what produces a phaser's notches (allpass stages only shift
+ *             phase, not magnitude, so their output alone is spectrally
+ *             flat and barely audible as an effect). This means dry_wet=255
+ *             still sounds like a phaser, not a flat/uneffected signal.
  *
  * No PSRAM/buffer needed: filter state is 8 small (x1,y1) float pairs (4
  * stages x 2 channels) plus one shared LFO phase float, all in .bss.

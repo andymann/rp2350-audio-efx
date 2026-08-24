@@ -116,15 +116,29 @@ void fx_phaser_process_block(float *out_l, float *out_r, uint32_t sample_count,
         float w = tanf((float)M_PI * fc / (float)sample_rate_hz);
         float a = (w - 1.0f) / (w + 1.0f);
 
-        float wet_l = out_l[i];
-        float wet_r = out_r[i];
+        float in_l = out_l[i];
+        float in_r = out_r[i];
+        float ap_l = in_l;
+        float ap_r = in_r;
         for (uint32_t s = 0; s < FX_PHASER_NUM_STAGES; s++) {
-            wet_l = allpass_process(&stages_l[s], wet_l, a);
-            wet_r = allpass_process(&stages_r[s], wet_r, a);
+            ap_l = allpass_process(&stages_l[s], ap_l, a);
+            ap_r = allpass_process(&stages_r[s], ap_r, a);
         }
 
-        out_l[i] = out_l[i] * dry + wet_l * wet;
-        out_r[i] = out_r[i] * dry + wet_r * wet;
+        // The "wet" bus is dry input SUMMED WITH the allpass output, not
+        // the allpass output alone. Allpass stages only shift phase --
+        // they don't touch magnitude -- so the notches a phaser is known
+        // for only appear from the interference between the original
+        // signal and its phase-shifted copy. Pure allpass output alone is
+        // spectrally flat and sounds close to unprocessed. This summation
+        // is the internal counterpart to the external dry/wet control
+        // below: with it, dry_wet=255 still sounds like a phaser, not a
+        // flat/uneffected signal.
+        float wet_bus_l = 0.5f * (in_l + ap_l);
+        float wet_bus_r = 0.5f * (in_r + ap_r);
+
+        out_l[i] = in_l * dry + wet_bus_l * wet;
+        out_r[i] = in_r * dry + wet_bus_r * wet;
 
         lfo_phase += phase_inc;
         if (lfo_phase >= 2.0f * (float)M_PI) lfo_phase -= 2.0f * (float)M_PI;
