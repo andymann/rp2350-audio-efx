@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the three FX commands below -- it is meant to be dead
+ * and only understands the five commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -32,6 +32,19 @@
  *     0x03
  *     Response is always 4 bytes: 0x03, FW_VERSION_MAJOR, FW_VERSION_MINOR,
  *     FW_VERSION_PATCH.
+ *
+ *   Set BPM        (0x04, 3 bytes total):
+ *     0x04, bpm_hi (MSB), bpm_lo (LSB)
+ *     The 16-bit value (bpm_hi << 8 | bpm_lo) is the tempo in BPM x100 --
+ *     e.g. 12345 (0x30, 0x39) means 123.45 BPM. The full 0-65535 range is
+ *     accepted; there is no invalid value, so this command always succeeds.
+ *     On success, the device echoes the exact 3-byte command back.
+ *
+ *   Query BPM      (0x05, 1 byte total):
+ *     0x05
+ *     Response is 3 bytes: 0x05, bpm_hi (MSB), bpm_lo (LSB) -- the current
+ *     stored tempo, same encoding as Set BPM. Defaults to 12000 (120.00 BPM)
+ *     at boot until a Set BPM command changes it.
  *
  * On boot, before any command is processed, the device sends the literal
  * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a
@@ -84,5 +97,12 @@ bool fx_control_owns_pin(uint8_t pin);
 // once individual effects are implemented, and by fx_control.c itself when
 // building a Query FX response.
 bool fx_control_get(uint8_t effect_num, FxState *out);
+
+// Current stored tempo in BPM x100 (e.g. 12345 == 123.45 BPM), as last set
+// by a Set BPM command. Defaults to 12000 (120.00 BPM) at boot. For use by
+// the
+// DSP pipeline once tempo-synced effects exist, and by fx_control.c itself
+// when building a Query BPM response.
+uint16_t fx_control_get_bpm(void);
 
 #endif // FX_CONTROL_H
