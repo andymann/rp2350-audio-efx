@@ -271,6 +271,17 @@ static void parse_ring(void) {
 
 void fx_control_init(void) {
     memset(fx_state, 0, sizeof(fx_state));
+
+    // Slot 3 (fx_phaser.c, FX_PHASER_EFFECT_NUM) ships with non-zero
+    // defaults so it's immediately musical the first time it's turned on,
+    // without needing a full Set FX command to pick sane values first:
+    // param1=0x06 (quarter-note LFO rate), param2=0xC0 (~75% sweep depth,
+    // 192/255). Still off (enabled=0, same as every other slot) until an
+    // explicit Set FX turns it on -- this only pre-loads param1/param2,
+    // it doesn't start the effect running at boot.
+    fx_state[3].param1 = 0x06u;
+    fx_state[3].param2 = 0xC0u;
+
     bpm_x100 = BPM_X100_DEFAULT;
     reset_parser();
     rx_head = 0;
