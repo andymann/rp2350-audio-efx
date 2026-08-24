@@ -22,11 +22,6 @@ pico_board_cmake_set(PICO_PLATFORM, rp2350)
 // For board detection
 #define RP2350B_AUDIO_EFX
 
-// --- BOARD SPECIFIC ---
-// GPIO driving the PSRAM's chip-select. TODO: confirm against your schematic;
-// this follows the same pin WeAct's RP2350B core board uses.
-#define RP2350B_AUDIO_EFX_PSRAM_CS_PIN 0
-
 // --- UART ---
 #ifndef PICO_DEFAULT_UART
 #define PICO_DEFAULT_UART 0
@@ -89,16 +84,36 @@ pico_board_cmake_set_default(PICO_FLASH_SIZE_BYTES, (16 * 1024 * 1024))
 #endif
 
 // --- PSRAM ---
-// 8MB QSPI PSRAM. Note: unlike flash, pico-sdk has no built-in PSRAM driver/
-// XIP setup at this SDK revision — the *_PSRAM_CS_PIN macro above is just a
-// board-level convention other boards also use (see weact_studio_rp2350b_core.h,
-// pimoroni_pico_plus2_rp2350.h). Actually mapping the PSRAM into the address
-// space still needs runtime QMI configuration, the same pattern DSPi already
-// uses for the flash clock divider override in flash_clkdiv.c — that will
-// need a PSRAM equivalent before any code can allocate into it.
-pico_board_cmake_set_default(PICO_RP2350_PSRAM_SIZE_BYTES, (8 * 1024 * 1024))
-#ifndef PICO_RP2350_PSRAM_SIZE_BYTES
-#define PICO_RP2350_PSRAM_SIZE_BYTES (8 * 1024 * 1024)
+// 8MB QSPI PSRAM, using pico-sdk 2.3.0's hardware_psram driver (see
+// firmware/DSPi/CMakeLists.txt for the hardware_psram link, and
+// firmware/CMakeLists.txt for the pico-sdk version pin).
+//
+// CS pin: switched to AUTO-DETECT rather than a hardcoded guess. The
+// previous revision hardcoded PICO_PSRAM_CS_PIN to GPIO0 (WeAct's RP2350B
+// core board's convention) with no verification -- with no auto-detect,
+// hardware_psram's init path just believes that pin has a working PSRAM
+// chip on it and configures the QMI bus accordingly, whether or not that's
+// actually true on THIS board's wiring. If the real CS pin is different,
+// the driver "succeeds" with no error, and every read/write silently hits
+// bus garbage instead of the actual chip -- a very plausible explanation
+// for noise that doesn't improve with clock-speed tuning, because the
+// clock was never the actual problem on that attempt.
+//
+// PICO_AUTO_DETECT_PSRAM scans the known CS1 GPIO candidates for RP2350B
+// (0, 8, 19, 47 -- see hardware_psram's PICO_AVAILABLE_CS1_GPIOS) and only
+// proceeds if it actually finds a chip and reads back a valid size/ID, so
+// this is self-correcting regardless of which of those four pins your
+// schematic actually uses. Once you've confirmed the real pin (e.g. by
+// checking which GPIO detection lands on, or from your schematic
+// directly), you can pin it back down with PICO_PSRAM_CS_PIN + turn this
+// off for a faster boot -- auto-detect briefly wiggles every candidate
+// pin, which is harmless but not something you want doing that on every
+// boot forever.
+#define PICO_AUTO_DETECT_PSRAM 1
+
+pico_board_cmake_set_default(PICO_PSRAM_SIZE_BYTES, (8 * 1024 * 1024))
+#ifndef PICO_PSRAM_SIZE_BYTES
+#define PICO_PSRAM_SIZE_BYTES (8 * 1024 * 1024)
 #endif
 
 // --- RP2350 VARIANT ---

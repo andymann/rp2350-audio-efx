@@ -3,7 +3,9 @@
  */
 
 #include "tempo_sync.h"
+#include "config.h"   // DSP_TIME_CRITICAL
 
+DSP_TIME_CRITICAL
 uint8_t tempo_sync_step_from_raw(uint8_t raw)
 {
     // 256 raw values / 16 steps = 16 raw values per step, 1-indexed.
@@ -12,6 +14,7 @@ uint8_t tempo_sync_step_from_raw(uint8_t raw)
     return step;
 }
 
+DSP_TIME_CRITICAL
 float tempo_sync_ms(uint8_t step, uint16_t bpm_x100)
 {
     if (step < 1) step = 1;
@@ -31,6 +34,7 @@ float tempo_sync_ms(uint8_t step, uint16_t bpm_x100)
     return ms;
 }
 
+DSP_TIME_CRITICAL
 uint32_t tempo_sync_samples(uint8_t step, uint16_t bpm_x100, uint32_t sample_rate_hz)
 {
     float ms = tempo_sync_ms(step, bpm_x100);
@@ -42,6 +46,7 @@ uint32_t tempo_sync_samples_from_raw(uint8_t raw, uint16_t bpm_x100, uint32_t sa
     return tempo_sync_samples(tempo_sync_step_from_raw(raw), bpm_x100, sample_rate_hz);
 }
 
+DSP_TIME_CRITICAL
 float fx_feedback_from_raw(uint8_t raw)
 {
     return ((float)raw / 255.0f) * FX_FEEDBACK_MAX;

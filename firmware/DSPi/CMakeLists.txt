@@ -5,7 +5,7 @@ add_compile_options(-O2)
 
 # Use -O3 for DSP-critical files
 set_source_files_properties(
-    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c upmix.c adat_output.c adat_input.c
+    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c upmix.c adat_output.c adat_input.c fx_delay.c tempo_sync.c
     PROPERTIES COMPILE_FLAGS "-O3"
 )
 
@@ -43,6 +43,8 @@ add_executable(DSPi
     flash_storage.h
     fx_control.c
     fx_control.h
+    fx_delay.c
+    fx_delay.h
     i2c_control.c
     i2c_control.h
     i2s_input.c
@@ -110,6 +112,10 @@ else()
     # RP2350: SPDIF RX on PIO2 (dedicated block, proven working).
     # I2S RX reuses the same SM when SPDIF RX is inactive.
     target_compile_definitions(DSPi PRIVATE PICO_SPDIF_RX_PIO=2)
+    # Board has 8MB QSPI PSRAM (PICO_PSRAM_SIZE_BYTES/PICO_PSRAM_CS_PIN set in
+    # boards/rp2350b_audio_efx.h); link the driver so runtime_init auto-brings
+    # it up and __uninitialized_psram()/__in_psram() are usable.
+    target_link_libraries(DSPi hardware_psram)
 endif()
 # PICO_FLASH_SPI_CLKDIV=6 is set at the top-level CMakeLists so it reaches
 # the boot2 build (target-level defines don't propagate to it).

@@ -37,12 +37,21 @@
 MEMORY
 {
     INCLUDE "pico_flash_region.ld"
+    INCLUDE "pico_psram_region.ld"
     RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 512k
     SCRATCH_X(rwx) : ORIGIN = 0x20080000, LENGTH = 4k
     SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k
 }
 
 ENTRY(_entry_point)
+
+/* hardware_psram (psram.c) needs a store region for any __in_psram()
+   (flash-initialized) data, aliased to FLASH like pico-sdk's own
+   memory_aliases_flash.incl does for the "default" (XIP) binary type. DSPi
+   doesn't currently use __in_psram(), only __uninitialized_psram(), so the
+   .psram_load section below stays empty -- but psram.c unconditionally
+   references its start/end/source symbols, so the section must still exist. */
+REGION_ALIAS("PSRAM_STORE", FLASH)
 
 SECTIONS
 {
@@ -205,6 +214,27 @@ SECTIONS
         . = ALIGN(4);
         *(.uninitialized_data*)
     } > RAM
+
+    /* PSRAM: this mirrors pico-sdk's sections_psram.incl. .psram_load stays
+       empty today (DSPi has no __in_psram() flash-initialized data, only
+       __uninitialized_psram()), but psram.c's runtime init unconditionally
+       references __psram_load_start__/__psram_load_end__/__psram_load_source__,
+       so the section must exist even though nothing lands in it. See
+       fx_delay.c for the first __uninitialized_psram() user (.psram_noload). */
+    .psram_load : {
+        __psram_start__ = .;
+        __psram_load_start__ = .;
+        *(SORT(.psram_initialised.*))
+        . = ALIGN(4);
+        __psram_load_end__ = .;
+    } > PSRAM AT> PSRAM_STORE
+    __psram_load_source__ = LOADADDR(.psram_load);
+
+    .psram_noload (NOLOAD) : {
+        *(SORT(.psram_uninitialised.*))
+        . = ALIGN(4);
+        __psram_end__ = .;
+    } > PSRAM
 
     .data : {
         __data_start__ = .;
