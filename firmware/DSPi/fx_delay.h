@@ -8,8 +8,8 @@
  * than a stereo ping-pong).
  *
  * Parameter mapping (see tempo_sync.h for the shared convention):
- *   param1  - time division, 1-16 steps (raw byte bucketed via
- *             tempo_sync_step_from_raw), converted to samples via
+ *   param1  - time division, 1-16 (raw byte IS the step number directly,
+ *             clamped at the edges via tempo_sync_step_from_raw()), converted to samples via
  *             tempo_sync_samples() against fx_control_get_bpm().
  *   param2  - feedback, raw byte scaled via fx_feedback_from_raw()
  *             (0.0-0.95).

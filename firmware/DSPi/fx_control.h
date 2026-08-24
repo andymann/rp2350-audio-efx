@@ -21,13 +21,31 @@
  *     A frame with effect_num > 7 or on_off > 1 is dropped: no echo, no
  *     state change.
  *
- *     As of the tempo-sync framework, every effect's time-based behavior
- *     follows a shared convention (see tempo_sync.h for the exact math):
- *       param1 = time division, 1-16 (raw byte bucketed into 16 steps;
- *                1-8 straight quarters of a 4/4 bar, 9-16 the same
- *                lengths as triplets)
- *       param2 = feedback, raw byte scaled to 0.0-FX_FEEDBACK_MAX
- *     param3 and dry_wet remain effect-specific / general purpose.
+ *     Every tempo-synced effect derives param1 from the internal tempo
+ *     (see tempo_sync.h), but NOT from one single shared scheme -- what
+ *     unit param1 is (and what param2/param3/dry_wet mean, if anything)
+ *     is effect-specific. See the slot registry below and each effect's
+ *     own header for the actual mapping.
+ *
+ *     Slot registry (effect_num -> effect):
+ *       0  fx_delay.c   - tempo-synced feedback delay. param1 = 1-16 step
+ *                         (quarters 1-8, triplets 9-16; see tempo_sync.h's
+ *                         tempo_sync_step_from_raw()). param2 = feedback,
+ *                         dry_wet = wet mix.
+ *       1  (unassigned)
+ *       2  fx_stutter.c - tempo-synced stutter/gate. param1 = direct count
+ *                         of 32nd notes, 1-255 (see fx_stutter.h's
+ *                         FX_STUTTER_SUBDIVISIONS_PER_BAR; finer
+ *                         resolution than fx_delay's scheme via
+ *                         tempo_sync.h's generic
+ *                         tempo_sync_bar_fraction_samples()). dry_wet =
+ *                         gate depth (255 = full silence when muted, 0 =
+ *                         no gating effect at all). param2/param3 unused.
+ *       3-7 (unassigned)
+ *     An unassigned slot's FxState still updates normally via Set FX (the
+ *     control plane doesn't know which slots have a DSP effect wired to
+ *     them), it just has nothing reading it yet -- same situation slot 0
+ *     was in before fx_delay existed.
  *
  *   Query FX      (0x02, 2 bytes total):
  *     0x02, effect_num[0-7]

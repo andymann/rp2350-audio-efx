@@ -8,10 +8,16 @@
 DSP_TIME_CRITICAL
 uint8_t tempo_sync_step_from_raw(uint8_t raw)
 {
-    // 256 raw values / 16 steps = 16 raw values per step, 1-indexed.
-    uint8_t step = (uint8_t)(raw >> 4) + 1;   // 0-15 -> 1-16
-    if (step > TEMPO_SYNC_STEPS) step = TEMPO_SYNC_STEPS;
-    return step;
+    // param1 IS the step number directly (1-16), clamped at the edges --
+    // not a raw 0-255 byte bucketed into 16 ranges. An earlier revision of
+    // this function did that bucketing ((raw >> 4) + 1), which meant
+    // param1 values 0x00-0x0F all mapped to step 1: confusing when setting
+    // param1 by hand over the FX UART, where sending literal 1, 2, 3...
+    // is the natural way to pick a step. 0 clamps up to step 1 (not an
+    // error -- there's no reason to refuse it) rather than down to 0.
+    if (raw < 1u) return 1u;
+    if (raw > TEMPO_SYNC_STEPS) return (uint8_t)TEMPO_SYNC_STEPS;
+    return raw;
 }
 
 DSP_TIME_CRITICAL
@@ -44,6 +50,27 @@ uint32_t tempo_sync_samples(uint8_t step, uint16_t bpm_x100, uint32_t sample_rat
 uint32_t tempo_sync_samples_from_raw(uint8_t raw, uint16_t bpm_x100, uint32_t sample_rate_hz)
 {
     return tempo_sync_samples(tempo_sync_step_from_raw(raw), bpm_x100, sample_rate_hz);
+}
+
+DSP_TIME_CRITICAL
+float tempo_sync_bar_fraction_ms(uint8_t n, uint16_t subdivisions_per_bar, uint16_t bpm_x100)
+{
+    if (n < 1u) n = 1u;   // guard a zero-length interval, same policy as tempo_sync_ms's step clamp
+    if (subdivisions_per_bar < 1u) subdivisions_per_bar = 1u;
+    if (bpm_x100 == 0) bpm_x100 = 1;   // guard div-by-zero from a bad Set BPM value
+
+    float bpm    = bpm_x100 / 100.0f;
+    float bar_ms = (60000.0f / bpm) * 4.0f;   // 4/4 bar = 4 quarters
+
+    return n * (bar_ms / (float)subdivisions_per_bar);
+}
+
+DSP_TIME_CRITICAL
+uint32_t tempo_sync_bar_fraction_samples(uint8_t n, uint16_t subdivisions_per_bar,
+                                          uint16_t bpm_x100, uint32_t sample_rate_hz)
+{
+    float ms = tempo_sync_bar_fraction_ms(n, subdivisions_per_bar, bpm_x100);
+    return (uint32_t)(ms * (float)sample_rate_hz / 1000.0f + 0.5f);
 }
 
 DSP_TIME_CRITICAL
