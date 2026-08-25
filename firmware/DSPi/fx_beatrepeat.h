@@ -1,39 +1,44 @@
 /*
  * fx_beatrepeat.h - Effect slot 5 (id 0x05): tempo-synced beat-repeat
  *
- * Always-recording design: a circular PSRAM buffer continuously captures
- * live audio, unconditionally, regardless of whether the effect is on or
- * off. The moment the effect is turned on, the most recent loop-length
- * worth of that recording is snapshotted into a second, frozen PSRAM
- * buffer and looped -- always split into a FIXED 8 equal slices (see
+ * Single-buffer, direct-record design: when the effect is turned on, live
+ * audio passes through unchanged while it's ALSO written directly into
+ * loop_buf. The instant the buffer is full (loop length has elapsed --
+ * e.g. 4 bars when param1==16), playback switches to looping that buffer
+ * -- always split into a FIXED 8 equal slices (see
  * FX_BEATREPEAT_NUM_SLICES), replayed in one of 16 orders per param2 --
- * until it's turned back off. Turning it off then on again snapshots a
- * FRESH window of whatever's playing right then -- the standard
- * beat-repeat/glitch-box behavior, and because recording never stops,
- * triggering is fast rather than needing a fill period.
+ * until it's turned back off. There's no separate "record" buffer and no
+ * copy step: the buffer being filled IS the buffer that gets played back,
+ * so the switch from filling to looping is just a phase change, not a
+ * data-movement operation -- nothing to introduce latency at that moment.
+ *
+ * When the effect is turned off, loop_buf is emptied (zeroed) so no
+ * session's captured audio lingers into a later one. This is spread
+ * across blocks the same way the old snapshot copy was (see
+ * FX_BEATREPEAT_CLEAR_CHUNK_SAMPLES) -- there's no urgency (the effect
+ * is bypassed/passthrough while disabled regardless of clearing
+ * progress), so this can safely take a little while in the background.
  *
  * STATE MACHINE (see fx_beatrepeat.c):
- *   Every sample, unconditionally: write the current input into the
- *   circular record_buf (wrapping), advancing the write pointer. This
- *   happens whether the effect is enabled or not, and even while it's
- *   actively looping (so a quick off/on re-trigger gets fresh audio, not
- *   a repeat of the same frozen content).
- *
  *   Disabled -> enabled (rising edge): loop length (param1 x current BPM)
- *   locks in for this session, and the SNAPSHOTTING phase begins: the
- *   most recent loop_len_samples of record_buf (as of the trigger moment)
- *   get copied into loop_buf. This copy is NOT done synchronously in one
- *   block -- copying up to 768000 samples inline would itself blow the
- *   real-time audio budget and cause an audible glitch, the exact
- *   problem this redesign is trying to avoid. Instead it's spread across
- *   multiple blocks in bounded chunks (FX_BEATREPEAT_COPY_CHUNK_SAMPLES
- *   per block); live audio passes through unmodified while a snapshot is
- *   in progress. Once the copy completes, playback switches to LOOPING.
- *   param2 changes still take effect at the start of the next full loop
- *   cycle once looping, same as before.
+ *   locks in for this session, RECORDING phase begins: live audio passes
+ *   through unmodified while loop_buf fills sample by sample from index
+ *   0. The instant it's full, playback switches to LOOPING (same
+ *   sample's audio decision, no gap): loop_buf plays on repeat, mixed
+ *   per dry_wet. param2 changes take effect at the start of the next
+ *   full loop cycle (not immediately), to avoid a mid-slice jump.
  *
- * Parameter mapping (reworked -- slice count is no longer a runtime
- * parameter, param2 took over param3's old role, param3 is now unused):
+ *   Enabled -> disabled (falling edge): a CLEARING phase begins,
+ *   zeroing loop_buf in the background (bounded chunk per block, same
+ *   reasoning as the old copy's chunking -- a large synchronous memset
+ *   could still cost real time on a PSRAM buffer). Output is plain
+ *   passthrough throughout, since the effect is off; clearing progress
+ *   has no audible effect while disabled. If re-enabled before clearing
+ *   finishes, RECORDING simply starts overwriting loop_buf from index 0
+ *   again -- correct either way, since playback only ever reads the
+ *   range RECORDING just finished (re)writing.
+ *
+ * Parameter mapping (unchanged from the previous revision):
  *   param1  - loop length, number of 16ths of a bar (NOT fx_stutter's
  *             32nds convention). tempo_sync_bar_fraction_ms(param1, 16,
  *             bpm_x100). Clamped to FX_BEATREPEAT_MAX_SIXTEENTHS (64 = 4
@@ -44,10 +49,9 @@
  *             is now the fixed FX_BEATREPEAT_NUM_SLICES=8, not
  *             runtime-configurable).
  *   dry_wet - wet mix, standard convention: 0 = fully dry, 255 = fully
- *             wet. During a SNAPSHOTTING phase (mid-copy, not yet
- *             looping), output is unmodified live audio regardless of
- *             dry_wet, same reasoning as before -- no valid wet signal
- *             exists yet.
+ *             wet. During the RECORDING fill (not yet looping), output
+ *             is unmodified live audio regardless of dry_wet, same
+ *             reasoning as before -- no valid wet signal exists yet.
  *
  * Every loop is split into exactly FX_BEATREPEAT_NUM_SLICES (8) equal
  * pieces. If the loop length doesn't divide evenly by 8, the LAST slice
@@ -55,8 +59,7 @@
  * samples so the full loop length is always covered exactly.
  *
  * PLAYBACK ORDERS (param2, 0-indexed slice positions internally, N is
- * always FX_BEATREPEAT_NUM_SLICES=8 now, but the algorithms themselves
- * are still written generically -- unchanged from when N was variable):
+ * always FX_BEATREPEAT_NUM_SLICES=8):
  *   0  Forward (identity): 0,1,2,...,N-1
  *   1  First + reverse rest (spec example, N=4: 1,4,3,2 in 1-indexed =
  *      0,3,2,1 in 0-indexed; at the now-fixed N=8 this generalizes to
@@ -90,8 +93,10 @@
 // at the longest loop length allowed (64 sixteenths = 4 bars) -> 16s @
 // 48kHz -> 768000 samples. A param1/BPM combination requesting longer
 // than this clamps to it rather than being refused, same policy as
-// fx_delay. Both record_buf and loop_buf are this size (two separate
-// PSRAM allocations -- see fx_beatrepeat.c).
+// fx_delay. Single PSRAM allocation now (see fx_beatrepeat.c) -- the
+// earlier always-recording revision needed two (a background recorder
+// plus a frozen snapshot); this design only needs the one buffer that's
+// both recorded into and played back from.
 #define FX_BEATREPEAT_MIN_PRACTICAL_BPM 60u
 #define FX_BEATREPEAT_MAX_SIXTEENTHS    64u
 #define FX_BEATREPEAT_MAX_SAMPLES       768000u
@@ -102,35 +107,22 @@
 // Number of distinct param2 playback orders.
 #define FX_BEATREPEAT_NUM_PATTERNS 16u
 
-// Per-block cap on how much of the record_buf -> loop_buf snapshot copy
-// happens in a single fx_beatrepeat_process_block() call, so an extreme
-// (near-maximum) loop length still can't do the whole copy synchronously
-// in one block (see fx_beatrepeat.h's top comment for why that would be
-// a problem). Raised from an earlier, more conservative 8192 -- that
-// value made even the DEFAULT loop length audibly spread across ~9
-// blocks (~35ms), which read as a perceptible delay on triggering. At
-// 96000, the default 12-sixteenth loop length (72000 samples) and
-// anything up to 2 bars completes within a SINGLE block -- no added
-// latency beyond the block's own ~4ms period, same as any other effect.
-// Only loop lengths longer than the chunk (approaching the 768000-sample
-// maximum) still spread across a few blocks (768000/96000 = 8 blocks,
-// ~32ms). The actual per-sample copy cost is now two memcpy() calls
-// rather than a per-element modulo (see fx_beatrepeat.c), which should
-// make this safe against the real-time budget, but PSRAM-to-PSRAM
-// memcpy throughput at the 40MHz QMI clock hasn't been measured on real
-// hardware -- if any delay is still audible (especially at long loop
-// lengths), that's a signal to lower this back down.
-#define FX_BEATREPEAT_COPY_CHUNK_SAMPLES 96000u
+// Per-block cap on how much of loop_buf gets zeroed in a single
+// fx_beatrepeat_process_block() call during the background CLEARING
+// phase (see fx_beatrepeat.h's top comment). No audible urgency behind
+// this number -- clearing happens while the effect is disabled/
+// passthrough regardless of progress -- so this is sized generously
+// just to keep each block's memset() call bounded rather than
+// unconditionally touching the whole 768000-sample buffer in one go.
+#define FX_BEATREPEAT_CLEAR_CHUNK_SAMPLES 96000u
 
 void fx_beatrepeat_init(void);
 
-// True iff fx_beatrepeat_init() confirmed BOTH PSRAM buffers (record_buf
-// and loop_buf) are actually mapped. Same purpose as fx_delay_psram_ok().
+// True iff fx_beatrepeat_init() confirmed loop_buf's PSRAM address range
+// is actually mapped. Same purpose as fx_delay_psram_ok().
 bool fx_beatrepeat_psram_ok(void);
 
 void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_count,
                                   uint32_t sample_rate_hz);
 
 #endif // FX_BEATREPEAT_H
-
-
