@@ -45,20 +45,37 @@
  *   correct either way, since playback only ever reads the range
  *   RECORDING just finished (re)writing.
  *
- * Parameter mapping (unchanged from the previous revision):
+ * Parameter mapping (param3 reworked -- see below; param1/param2/dry_wet
+ * unchanged from the previous revision):
  *   param1  - loop length, number of 16ths of a bar (NOT fx_stutter's
  *             32nds convention). tempo_sync_bar_fraction_ms(param1, 16,
  *             bpm_x100). Clamped to FX_BEATREPEAT_MAX_SIXTEENTHS (64 = 4
  *             bars). Default 12 (0.75 bar).
  *   param2  - playback order, 0-15 (clamped at the edges). 0 is normal
  *             (forward) playback. See PLAYBACK ORDERS below. Default 0.
- *   param3  - unused/obsolete (previously slice count; the slice count
- *             is now the fixed FX_BEATREPEAT_NUM_SLICES=8, not
- *             runtime-configurable).
- *   dry_wet - wet mix, standard convention: 0 = fully dry, 255 = fully
- *             wet. During the RECORDING fill (not yet looping), output
- *             is unmodified live audio regardless of dry_wet, same
- *             reasoning as before -- no valid wet signal exists yet.
+ *   param3  - live gain: how much of the INCOMING (pre-effect) signal is
+ *             heard, independent of dry_wet. 0 = incoming audio
+ *             completely blocked (only the loop is heard, per dry_wet);
+ *             255 = incoming audio passed through at full level AND
+ *             summed with the loop. NOT a crossfade complementary to
+ *             dry_wet -- param3 and dry_wet are two independent gains on
+ *             two different signals (live input vs. the loop), so both
+ *             maxed means both are heard together at full level, not
+ *             blended. Only applies during LOOPING; during the RECORDING
+ *             fill, output is always unmodified live audio regardless of
+ *             param3 (there's no loop yet for "mixed with the loop" to
+ *             mean anything).
+ *   dry_wet - loop gain: how much of the loop is heard, standard
+ *             convention (0 = none, 255 = full). During the RECORDING
+ *             fill (not yet looping), output is unmodified live audio
+ *             regardless of dry_wet, same reasoning as param3 -- no
+ *             valid wet signal exists yet.
+ *
+ * Disabling the effect while LOOPING fades param3's live gain UP to 1.0
+ * (full passthrough) and dry_wet's loop gain DOWN to 0 over the same
+ * FX_BEATREPEAT_FADE_SAMPLES window (see fx_beatrepeat.c's
+ * PHASE_FADING_OUT) -- disabling always ends at plain, unprocessed
+ * passthrough, regardless of what param3 was set to while looping.
  *
  * Every loop is split into exactly FX_BEATREPEAT_NUM_SLICES (8) equal
  * pieces. If the loop length doesn't divide evenly by 8, the LAST slice

@@ -24,7 +24,8 @@ static uint32_t loop_len_samples = 0;    // locked in at the enable-edge
 static uint32_t record_pos = 0;          // 0..loop_len_samples-1, during RECORDING
 static uint32_t clear_pos = 0;           // 0..FX_BEATREPEAT_MAX_SAMPLES, during CLEARING
 static uint32_t fade_pos = 0;            // 0..FX_BEATREPEAT_FADE_SAMPLES, during FADING_OUT
-static float    fade_start_wet = 0.0f;   // wet mix ratio at the moment the fade began
+static float    fade_start_wet = 0.0f;   // loop wet gain at the moment the fade began
+static float    fade_start_live = 0.0f;  // live gain (param3-based) at the moment the fade began
 
 typedef struct {
     uint32_t start;   // sample offset within loop_buf
@@ -51,6 +52,7 @@ void fx_beatrepeat_init(void)
     clear_pos = 0;
     fade_pos = 0;
     fade_start_wet = 0.0f;
+    fade_start_live = 0.0f;
     seq_idx = 0;
     samples_into_slice = 0;
 }
@@ -214,14 +216,18 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
         phase = PHASE_RECORDING;
     } else if (falling_edge) {
         if (phase == PHASE_LOOPING) {
-            // Was actively mixing in the wet (looped) signal -- an
-            // instant switch to raw passthrough would jump between two
-            // unrelated waveforms with no continuity at the seam,
-            // audible as a click/crackle. Fade the wet contribution to
-            // 0 (and dry back to full) over FX_BEATREPEAT_FADE_SAMPLES
-            // instead of cutting it instantly.
+            // Was actively mixing in the wet (looped) signal and
+            // possibly a partial (param3-scaled) live signal -- an
+            // instant switch to raw passthrough would jump between
+            // whatever that mix was and the live signal at full gain,
+            // audible as a click/crackle. Fade the loop's contribution
+            // to 0 AND the live gain up to full (1.0 -- disabling always
+            // means "back to normal passthrough", regardless of what
+            // param3 was set to while looping) over
+            // FX_BEATREPEAT_FADE_SAMPLES instead of jumping instantly.
             fade_pos = 0;
             fade_start_wet = (float)st.dry_wet / 255.0f;
+            fade_start_live = (float)st.param3 / 255.0f;
             phase = PHASE_FADING_OUT;
         } else {
             // Was RECORDING (already plain passthrough, nothing to fade)
@@ -246,7 +252,6 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
     }
 
     float wet = (float)st.dry_wet / 255.0f;
-    float dry = 1.0f - wet;
 
     for (uint32_t i = 0; i < sample_count; i++) {
         float in_l = out_l[i];
@@ -278,18 +283,19 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
         if (phase == PHASE_FADING_OUT) {
             // Same playback as LOOPING (the loop content keeps advancing
             // naturally, avoiding a second discontinuity in the wet
-            // signal itself), but wet/dry ramp linearly toward fully dry
-            // over the fade window.
+            // signal itself), but the loop's gain ramps down to 0 while
+            // the live gain ramps UP to 1.0 (full passthrough) over the
+            // fade window -- ends exactly at the disabled/bypass state.
             float t = (float)fade_pos / (float)FX_BEATREPEAT_FADE_SAMPLES;
-            float fade_wet = fade_start_wet * (1.0f - t);
-            float fade_dry = 1.0f - fade_wet;
+            float fade_wet  = fade_start_wet * (1.0f - t);
+            float fade_live = fade_start_live + (1.0f - fade_start_live) * t;
 
             uint8_t orig_slice = slice_order[seq_idx];
             uint32_t sample_offset = slice_info[orig_slice].start + samples_into_slice;
             float wet_sample = (float)loop_buf[sample_offset] * (1.0f / 32767.0f);
 
-            out_l[i] = in_l * fade_dry + wet_sample * fade_wet;
-            out_r[i] = in_r * fade_dry + wet_sample * fade_wet;
+            out_l[i] = in_l * fade_live + wet_sample * fade_wet;
+            out_r[i] = in_r * fade_live + wet_sample * fade_wet;
 
             samples_into_slice++;
             if (samples_into_slice >= slice_info[orig_slice].len) {
@@ -313,13 +319,19 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
             continue;   // IDLE or CLEARING: passthrough (out_l/out_r left as-is)
         }
 
-        // PHASE_LOOPING
+        // PHASE_LOOPING. param3 and dry_wet are independent gains, not a
+        // complementary crossfade: param3 controls how much of the LIVE
+        // incoming signal is heard (0 = blocked, 255 = full), dry_wet
+        // controls how much of the LOOP is heard -- at both maxed, the
+        // two are summed together ("passed through and mixed with the
+        // loop", per spec), not blended.
         uint8_t orig_slice = slice_order[seq_idx];
         uint32_t sample_offset = slice_info[orig_slice].start + samples_into_slice;
         float wet_sample = (float)loop_buf[sample_offset] * (1.0f / 32767.0f);
+        float live_gain = (float)st.param3 / 255.0f;
 
-        out_l[i] = in_l * dry + wet_sample * wet;
-        out_r[i] = in_r * dry + wet_sample * wet;
+        out_l[i] = in_l * live_gain + wet_sample * wet;
+        out_r[i] = in_r * live_gain + wet_sample * wet;
 
         samples_into_slice++;
         if (samples_into_slice >= slice_info[orig_slice].len) {
