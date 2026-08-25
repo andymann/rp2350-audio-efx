@@ -58,10 +58,11 @@
  *       5  fx_beatrepeat.c - tempo-synced beat-repeat/glitch. param1 =
  *                         loop length in 16ths of a bar (NOT the same
  *                         32nds convention fx_stutter uses). param2 =
- *                         slice count. param3 = playback order, 0-15
- *                         (see fx_beatrepeat.h's PLAYBACK ORDERS list).
+ *                         playback order, 0-15 (fixed 8-slice loop; see
+ *                         fx_beatrepeat.h's PLAYBACK ORDERS list). param3
+ *                         unused/obsolete (previously slice count).
  *                         dry_wet = wet mix. Defaults: param1=12,
- *                         param2=4.
+ *                         param2=0.
  *       6-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
  *     control plane doesn't know which slots have a DSP effect wired to

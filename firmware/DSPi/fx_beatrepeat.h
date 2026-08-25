@@ -5,11 +5,12 @@
  * live audio, unconditionally, regardless of whether the effect is on or
  * off. The moment the effect is turned on, the most recent loop-length
  * worth of that recording is snapshotted into a second, frozen PSRAM
- * buffer and looped (sliced into param2 equal pieces, replayed in one of
- * 16 orders per param3) until it's turned back off. Turning it off then
- * on again snapshots a FRESH window of whatever's playing right then --
- * the standard beat-repeat/glitch-box behavior, and because recording
- * never stops, triggering is fast rather than needing a fill period.
+ * buffer and looped -- always split into a FIXED 8 equal slices (see
+ * FX_BEATREPEAT_NUM_SLICES), replayed in one of 16 orders per param2 --
+ * until it's turned back off. Turning it off then on again snapshots a
+ * FRESH window of whatever's playing right then -- the standard
+ * beat-repeat/glitch-box behavior, and because recording never stops,
+ * triggering is fast rather than needing a fill period.
  *
  * STATE MACHINE (see fx_beatrepeat.c):
  *   Every sample, unconditionally: write the current input into the
@@ -28,30 +29,38 @@
  *   multiple blocks in bounded chunks (FX_BEATREPEAT_COPY_CHUNK_SAMPLES
  *   per block); live audio passes through unmodified while a snapshot is
  *   in progress. Once the copy completes, playback switches to LOOPING.
- *   param2/param3 changes still take effect at the start of the next
- *   full loop cycle once looping, same as before.
+ *   param2 changes still take effect at the start of the next full loop
+ *   cycle once looping, same as before.
  *
- * Parameter mapping: unchanged from the previous revision -- see below,
- * copied for reference.
+ * Parameter mapping (reworked -- slice count is no longer a runtime
+ * parameter, param2 took over param3's old role, param3 is now unused):
  *   param1  - loop length, number of 16ths of a bar (NOT fx_stutter's
  *             32nds convention). tempo_sync_bar_fraction_ms(param1, 16,
  *             bpm_x100). Clamped to FX_BEATREPEAT_MAX_SIXTEENTHS (64 = 4
  *             bars). Default 12 (0.75 bar).
- *   param2  - number of slices, clamped to FX_BEATREPEAT_MAX_SLICES (32).
- *             Default 4. Uneven division: the LAST original slice
- *             absorbs the remainder samples.
- *   param3  - playback order, 0-15. See PLAYBACK ORDERS below.
+ *   param2  - playback order, 0-15 (clamped at the edges). 0 is normal
+ *             (forward) playback. See PLAYBACK ORDERS below. Default 0.
+ *   param3  - unused/obsolete (previously slice count; the slice count
+ *             is now the fixed FX_BEATREPEAT_NUM_SLICES=8, not
+ *             runtime-configurable).
  *   dry_wet - wet mix, standard convention: 0 = fully dry, 255 = fully
  *             wet. During a SNAPSHOTTING phase (mid-copy, not yet
  *             looping), output is unmodified live audio regardless of
  *             dry_wet, same reasoning as before -- no valid wet signal
  *             exists yet.
  *
- * PLAYBACK ORDERS (param3, 0-indexed slice positions internally, N =
- * current slice count) -- unchanged from the previous revision:
+ * Every loop is split into exactly FX_BEATREPEAT_NUM_SLICES (8) equal
+ * pieces. If the loop length doesn't divide evenly by 8, the LAST slice
+ * (by original position, not playback order) absorbs the remainder
+ * samples so the full loop length is always covered exactly.
+ *
+ * PLAYBACK ORDERS (param2, 0-indexed slice positions internally, N is
+ * always FX_BEATREPEAT_NUM_SLICES=8 now, but the algorithms themselves
+ * are still written generically -- unchanged from when N was variable):
  *   0  Forward (identity): 0,1,2,...,N-1
  *   1  First + reverse rest (spec example, N=4: 1,4,3,2 in 1-indexed =
- *      0,3,2,1 in 0-indexed): 0, N-1, N-2, ..., 1
+ *      0,3,2,1 in 0-indexed; at the now-fixed N=8 this generalizes to
+ *      1,8,7,6,5,4,3,2 in 1-indexed): 0, N-1, N-2, ..., 1
  *   2  Full reverse: N-1, N-2, ..., 0
  *   3  Last + forward rest: N-1, 0, 1, ..., N-2
  *   4  Adjacent pairs swapped: 1,0,3,2,5,4,... (odd N: last slice stays)
@@ -87,10 +96,10 @@
 #define FX_BEATREPEAT_MAX_SIXTEENTHS    64u
 #define FX_BEATREPEAT_MAX_SAMPLES       768000u
 
-// Ceiling on param2 (slice count) -- judgment call, not specified.
-#define FX_BEATREPEAT_MAX_SLICES 32u
+// Fixed slice count -- no longer a runtime parameter.
+#define FX_BEATREPEAT_NUM_SLICES 8u
 
-// Number of distinct param3 playback orders.
+// Number of distinct param2 playback orders.
 #define FX_BEATREPEAT_NUM_PATTERNS 16u
 
 // Per-block cap on how much of the record_buf -> loop_buf snapshot copy
@@ -114,4 +123,5 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
                                   uint32_t sample_rate_hz);
 
 #endif // FX_BEATREPEAT_H
+
 

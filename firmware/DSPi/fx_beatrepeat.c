@@ -34,9 +34,8 @@ typedef struct {
     uint32_t len;      // length in samples
 } SliceInfo;
 
-static SliceInfo slice_info[FX_BEATREPEAT_MAX_SLICES];
-static uint8_t   slice_order[FX_BEATREPEAT_MAX_SLICES];
-static uint8_t   current_num_slices = 1;
+static SliceInfo slice_info[FX_BEATREPEAT_NUM_SLICES];
+static uint8_t   slice_order[FX_BEATREPEAT_NUM_SLICES];
 
 static uint32_t seq_idx = 0;             // position within slice_order[], during LOOPING
 static uint32_t samples_into_slice = 0;
@@ -56,7 +55,6 @@ void fx_beatrepeat_init(void)
     loop_len_samples = 0;
     snapshot_src_start = 0;
     snapshot_copied = 0;
-    current_num_slices = 1;
     seq_idx = 0;
     samples_into_slice = 0;
 }
@@ -66,17 +64,16 @@ bool fx_beatrepeat_psram_ok(void)
     return psram_ok;
 }
 
-// Fills slice_info[] (boundaries of the current_num_slices equal pieces,
-// last one absorbing any remainder so the total covers loop_len_samples
-// exactly) and slice_order[] (the param3 playback permutation) for the
-// CURRENT loop_len_samples/num_slices/pattern. Called once when a
-// snapshot copy completes and once per full loop-cycle wraparound (so
-// param2/param3 changes take effect at a clean boundary, not mid-slice).
-static void compute_slices_and_order(uint8_t num_slices, uint8_t pattern)
+// Fills slice_info[] (boundaries of the FX_BEATREPEAT_NUM_SLICES equal
+// pieces, last one absorbing any remainder so the total covers
+// loop_len_samples exactly) and slice_order[] (the param2 playback
+// permutation) for the CURRENT loop_len_samples/pattern. Called once
+// when a snapshot copy completes and once per full loop-cycle
+// wraparound (so param2 changes take effect at a clean boundary, not
+// mid-slice).
+static void compute_slice_order(uint8_t pattern)
 {
-    if (num_slices < 1u) num_slices = 1u;
-    if (num_slices > FX_BEATREPEAT_MAX_SLICES) num_slices = (uint8_t)FX_BEATREPEAT_MAX_SLICES;
-    current_num_slices = num_slices;
+    const uint8_t num_slices = FX_BEATREPEAT_NUM_SLICES;
 
     uint32_t base_len  = loop_len_samples / num_slices;
     uint32_t remainder = loop_len_samples % num_slices;
@@ -241,7 +238,7 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
             phase = PHASE_LOOPING;
             seq_idx = 0;
             samples_into_slice = 0;
-            compute_slices_and_order(st.param2, st.param3);
+            compute_slice_order(st.param2);
         }
     }
 
@@ -277,11 +274,11 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
         if (samples_into_slice >= slice_info[orig_slice].len) {
             samples_into_slice = 0;
             seq_idx++;
-            if (seq_idx >= current_num_slices) {
+            if (seq_idx >= FX_BEATREPEAT_NUM_SLICES) {
                 seq_idx = 0;
-                // Full cycle complete: re-read param2/param3 for the next
+                // Full cycle complete: re-read param2 for the next
                 // cycle (a clean boundary to change them at, not mid-slice).
-                compute_slices_and_order(st.param2, st.param3);
+                compute_slice_order(st.param2);
             }
         }
     }
