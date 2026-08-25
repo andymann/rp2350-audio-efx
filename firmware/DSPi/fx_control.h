@@ -60,8 +60,10 @@
  *                         32nds convention fx_stutter uses). param2 =
  *                         playback order, 0-15 (fixed 8-slice loop; see
  *                         fx_beatrepeat.h's PLAYBACK ORDERS list). param3
- *                         unused/obsolete (previously slice count).
- *                         dry_wet = wet mix. Defaults: param1=12,
+ *                         = live gain (0 = incoming audio blocked, 255 =
+ *                         passed through and summed with the loop) --
+ *                         independent of dry_wet, not a crossfade with
+ *                         it. dry_wet = loop gain. Defaults: param1=12,
  *                         param2=0.
  *       6-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
