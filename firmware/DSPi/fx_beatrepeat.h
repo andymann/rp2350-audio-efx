@@ -28,15 +28,22 @@
  *   per dry_wet. param2 changes take effect at the start of the next
  *   full loop cycle (not immediately), to avoid a mid-slice jump.
  *
- *   Enabled -> disabled (falling edge): a CLEARING phase begins,
- *   zeroing loop_buf in the background (bounded chunk per block, same
- *   reasoning as the old copy's chunking -- a large synchronous memset
- *   could still cost real time on a PSRAM buffer). Output is plain
- *   passthrough throughout, since the effect is off; clearing progress
- *   has no audible effect while disabled. If re-enabled before clearing
- *   finishes, RECORDING simply starts overwriting loop_buf from index 0
- *   again -- correct either way, since playback only ever reads the
- *   range RECORDING just finished (re)writing.
+ *   Enabled -> disabled (falling edge): if the effect was actively
+ *   LOOPING, a brief FADING_OUT phase runs first (FX_BEATREPEAT_FADE_SAMPLES,
+ *   ~2.7ms) -- ramping the wet contribution to 0 rather than cutting it
+ *   instantly, since an instant switch from the wet loop signal to raw
+ *   passthrough is an audible click (two unrelated waveforms with no
+ *   continuity at the seam). If it was RECORDING (already plain
+ *   passthrough) or already idle, there's nothing to fade, so it goes
+ *   straight to CLEARING. Either way, CLEARING then zeroes loop_buf in
+ *   the background (bounded chunk per block, same reasoning as the old
+ *   copy's chunking -- a large synchronous memset could still cost real
+ *   time on a PSRAM buffer). Output is plain passthrough throughout
+ *   CLEARING, since the effect is off; clearing progress has no audible
+ *   effect while disabled. If re-enabled before clearing finishes,
+ *   RECORDING simply starts overwriting loop_buf from index 0 again --
+ *   correct either way, since playback only ever reads the range
+ *   RECORDING just finished (re)writing.
  *
  * Parameter mapping (unchanged from the previous revision):
  *   param1  - loop length, number of 16ths of a bar (NOT fx_stutter's
@@ -115,6 +122,17 @@
 // just to keep each block's memset() call bounded rather than
 // unconditionally touching the whole 768000-sample buffer in one go.
 #define FX_BEATREPEAT_CLEAR_CHUNK_SAMPLES 96000u
+
+// Length of the fade-to-dry ramp when the effect is disabled while
+// actively LOOPING (see fx_beatrepeat.c's PHASE_FADING_OUT). An instant
+// switch from the wet loop signal to raw passthrough is a discontinuity
+// between two unrelated waveforms -- audible as a click/crackle. 128
+// samples (~2.7ms @ 48kHz) is short enough not to read as a deliberate
+// "fade" but long enough to remove the seam. Not needed on any other
+// transition: disabling during RECORDING, or the rising edge itself, are
+// both already passthrough-to-passthrough with nothing discontinuous to
+// smooth.
+#define FX_BEATREPEAT_FADE_SAMPLES 128u
 
 void fx_beatrepeat_init(void);
 

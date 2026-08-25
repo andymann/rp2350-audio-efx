@@ -17,12 +17,14 @@ static int16_t __uninitialized_psram("fx_beatrepeat") loop_buf[FX_BEATREPEAT_MAX
 static bool psram_ok = false;
 static bool was_enabled = false;
 
-typedef enum { PHASE_IDLE, PHASE_CLEARING, PHASE_RECORDING, PHASE_LOOPING } Phase;
+typedef enum { PHASE_IDLE, PHASE_CLEARING, PHASE_RECORDING, PHASE_LOOPING, PHASE_FADING_OUT } Phase;
 static Phase phase = PHASE_IDLE;
 
 static uint32_t loop_len_samples = 0;    // locked in at the enable-edge
 static uint32_t record_pos = 0;          // 0..loop_len_samples-1, during RECORDING
 static uint32_t clear_pos = 0;           // 0..FX_BEATREPEAT_MAX_SAMPLES, during CLEARING
+static uint32_t fade_pos = 0;            // 0..FX_BEATREPEAT_FADE_SAMPLES, during FADING_OUT
+static float    fade_start_wet = 0.0f;   // wet mix ratio at the moment the fade began
 
 typedef struct {
     uint32_t start;   // sample offset within loop_buf
@@ -47,6 +49,8 @@ void fx_beatrepeat_init(void)
     loop_len_samples = 0;
     record_pos = 0;
     clear_pos = 0;
+    fade_pos = 0;
+    fade_start_wet = 0.0f;
     seq_idx = 0;
     samples_into_slice = 0;
 }
@@ -209,11 +213,23 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
         record_pos = 0;
         phase = PHASE_RECORDING;
     } else if (falling_edge) {
-        // Begin zeroing loop_buf in the background -- see
-        // fx_beatrepeat.h's top comment for why this is chunked rather
-        // than one synchronous memset.
-        clear_pos = 0;
-        phase = PHASE_CLEARING;
+        if (phase == PHASE_LOOPING) {
+            // Was actively mixing in the wet (looped) signal -- an
+            // instant switch to raw passthrough would jump between two
+            // unrelated waveforms with no continuity at the seam,
+            // audible as a click/crackle. Fade the wet contribution to
+            // 0 (and dry back to full) over FX_BEATREPEAT_FADE_SAMPLES
+            // instead of cutting it instantly.
+            fade_pos = 0;
+            fade_start_wet = (float)st.dry_wet / 255.0f;
+            phase = PHASE_FADING_OUT;
+        } else {
+            // Was RECORDING (already plain passthrough, nothing to fade)
+            // or already IDLE/CLEARING -- no discontinuity to smooth,
+            // go straight to clearing.
+            clear_pos = 0;
+            phase = PHASE_CLEARING;
+        }
     }
 
     // Background clearing: bounded chunk per block, no audible urgency
@@ -255,6 +271,40 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
                 seq_idx = 0;
                 samples_into_slice = 0;
                 compute_slice_order(st.param2);
+            }
+            continue;
+        }
+
+        if (phase == PHASE_FADING_OUT) {
+            // Same playback as LOOPING (the loop content keeps advancing
+            // naturally, avoiding a second discontinuity in the wet
+            // signal itself), but wet/dry ramp linearly toward fully dry
+            // over the fade window.
+            float t = (float)fade_pos / (float)FX_BEATREPEAT_FADE_SAMPLES;
+            float fade_wet = fade_start_wet * (1.0f - t);
+            float fade_dry = 1.0f - fade_wet;
+
+            uint8_t orig_slice = slice_order[seq_idx];
+            uint32_t sample_offset = slice_info[orig_slice].start + samples_into_slice;
+            float wet_sample = (float)loop_buf[sample_offset] * (1.0f / 32767.0f);
+
+            out_l[i] = in_l * fade_dry + wet_sample * fade_wet;
+            out_r[i] = in_r * fade_dry + wet_sample * fade_wet;
+
+            samples_into_slice++;
+            if (samples_into_slice >= slice_info[orig_slice].len) {
+                samples_into_slice = 0;
+                seq_idx++;
+                if (seq_idx >= FX_BEATREPEAT_NUM_SLICES) seq_idx = 0;
+                // No compute_slice_order() call here -- the fade is brief
+                // (FX_BEATREPEAT_FADE_SAMPLES) and about to end anyway,
+                // not worth reacting to a param2 change mid-fade.
+            }
+
+            fade_pos++;
+            if (fade_pos >= FX_BEATREPEAT_FADE_SAMPLES) {
+                clear_pos = 0;
+                phase = PHASE_CLEARING;
             }
             continue;
         }
