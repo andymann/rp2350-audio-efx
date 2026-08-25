@@ -39,6 +39,7 @@
 #include "uart_control.h"
 #include "fx_control.h"
 #include "fx_delay.h"
+#include "fx_reverb.h"
 #include "fx_stutter.h"
 #include "fx_phaser.h"
 #include "fx_djfilter.h"
@@ -1924,6 +1925,11 @@ void core0_init() {
     // audio through it. No pin/ordering constraints of its own -- just
     // needs to happen before process_input_block() can run.
     fx_delay_init();
+
+    // Reset FX reverb tank state (slot 1). Same ordering requirement as
+    // fx_delay_init() above: no pins to claim, just needs to run before
+    // the pipeline starts.
+    fx_reverb_init();
 
     // Reset FX stutter phase (slot 2). Same ordering requirement as
     // fx_delay_init() above: no pins to claim, just needs to run before

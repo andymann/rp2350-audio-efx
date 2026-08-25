@@ -28,7 +28,8 @@
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "fx_control.h"
 #include "fx_delay.h"   // FX slot 0: tempo-synced delay on the main S/PDIF 1 pair
-#include "fx_stutter.h" // FX slot 2: tempo-synced stutter/gate, chained after slot 0
+#include "fx_reverb.h"  // FX slot 1: tempo-synced pre-delay reverb, chained after slot 0
+#include "fx_stutter.h" // FX slot 2: tempo-synced stutter/gate, chained after slot 1
 #include "fx_phaser.h"  // FX slot 3: tempo-synced phaser, chained after slot 2
 #include "fx_djfilter.h" // FX slot 4: DJ-style sweep filter, chained after slot 3
 #include "fx_beatrepeat.h" // FX slot 5: tempo-synced beat-repeat, chained after slot 4
@@ -515,10 +516,13 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // for now (this branch); not yet ported to the RP2040 int32 path below.
     fx_delay_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
 
-    // Slot 2 (stutter) chained right after slot 0 (delay) so effects run
-    // in ascending effect_num order -- gates the delay's wet trail too,
-    // not just the dry signal. See fx_stutter.h. Slot 1 intentionally
-    // unassigned; see fx_control.h's slot registry comment.
+    // Slot 1 (reverb) chained after slot 0 (delay), same ascending-
+    // effect_num ordering. See fx_reverb.h.
+    fx_reverb_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
+
+    // Slot 2 (stutter) chained after slot 1, same ascending-effect_num
+    // ordering -- gates the delay's and reverb's wet trails too, not
+    // just the dry signal. See fx_stutter.h.
     fx_stutter_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
 
     // Slot 3 (phaser) chained after slot 2, same ascending-effect_num
