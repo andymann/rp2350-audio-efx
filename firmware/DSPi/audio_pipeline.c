@@ -31,6 +31,7 @@
 #include "fx_stutter.h" // FX slot 2: tempo-synced stutter/gate, chained after slot 0
 #include "fx_phaser.h"  // FX slot 3: tempo-synced phaser, chained after slot 2
 #include "fx_djfilter.h" // FX slot 4: DJ-style sweep filter, chained after slot 3
+#include "fx_beatrepeat.h" // FX slot 5: tempo-synced beat-repeat, chained after slot 4
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
@@ -527,6 +528,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // Slot 4 (DJ filter) chained after slot 3, same ascending-effect_num
     // ordering. See fx_djfilter.h.
     fx_djfilter_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
+
+    // Slot 5 (beat-repeat) chained after slot 4, same ascending-effect_num
+    // ordering. See fx_beatrepeat.h.
+    fx_beatrepeat_process_block(buf_out[0], buf_out[1], sample_count, sample_rate_hz);
 
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
     // Slot finalization mode for THIS packet (see output_s24.h): in-place S24

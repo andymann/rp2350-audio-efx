@@ -290,6 +290,12 @@ void fx_control_init(void) {
     fx_state[4].param1 = 0x7Fu;
     fx_state[4].param2 = 0x40u;
 
+    // Slot 5 (fx_beatrepeat.c, FX_BEATREPEAT_EFFECT_NUM) ships with its
+    // spec'd defaults: param1=12 (0.75 bar loop length), param2=4 (4
+    // slices).
+    fx_state[5].param1 = 12u;
+    fx_state[5].param2 = 4u;
+
     bpm_x100 = BPM_X100_DEFAULT;
     reset_parser();
     rx_head = 0;
