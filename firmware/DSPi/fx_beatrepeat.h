@@ -30,7 +30,7 @@
  *
  *   Enabled -> disabled (falling edge): if the effect was actively
  *   LOOPING, a brief FADING_OUT phase runs first (FX_BEATREPEAT_FADE_SAMPLES,
- *   ~2.7ms) -- ramping the wet contribution to 0 rather than cutting it
+ *   ~21ms) -- ramping the wet contribution to 0 rather than cutting it
  *   instantly, since an instant switch from the wet loop signal to raw
  *   passthrough is an audible click (two unrelated waveforms with no
  *   continuity at the seam). If it was RECORDING (already plain
@@ -116,23 +116,30 @@
 
 // Per-block cap on how much of loop_buf gets zeroed in a single
 // fx_beatrepeat_process_block() call during the background CLEARING
-// phase (see fx_beatrepeat.h's top comment). No audible urgency behind
-// this number -- clearing happens while the effect is disabled/
-// passthrough regardless of progress -- so this is sized generously
-// just to keep each block's memset() call bounded rather than
-// unconditionally touching the whole 768000-sample buffer in one go.
-#define FX_BEATREPEAT_CLEAR_CHUNK_SAMPLES 96000u
+// phase (see fx_beatrepeat.h's top comment). Kept SMALL and conservative
+// -- unlike the old snapshot-copy's chunk size (which had a genuine
+// latency requirement pushing it up to 96000), clearing has NO latency
+// requirement at all: it's invisible background housekeeping the whole
+// time the effect is disabled/passthrough. A too-large chunk risks
+// costing real time on a PSRAM buffer (unverified throughput at the
+// 40MHz QMI clock) for zero user-facing benefit, so this errs toward
+// safety -- full clearing at the 768000-sample maximum takes ~188 blocks
+// (~750ms wall-clock) at this size, which is fine since nothing is
+// waiting on it.
+#define FX_BEATREPEAT_CLEAR_CHUNK_SAMPLES 4096u
 
 // Length of the fade-to-dry ramp when the effect is disabled while
 // actively LOOPING (see fx_beatrepeat.c's PHASE_FADING_OUT). An instant
 // switch from the wet loop signal to raw passthrough is a discontinuity
-// between two unrelated waveforms -- audible as a click/crackle. 128
-// samples (~2.7ms @ 48kHz) is short enough not to read as a deliberate
-// "fade" but long enough to remove the seam. Not needed on any other
-// transition: disabling during RECORDING, or the rising edge itself, are
-// both already passthrough-to-passthrough with nothing discontinuous to
-// smooth.
-#define FX_BEATREPEAT_FADE_SAMPLES 128u
+// between two unrelated waveforms -- audible as a click/crackle. 1024
+// samples (~21ms @ 48kHz) covers at least a couple of full cycles even
+// for low bass content (e.g. 100Hz's period is 480 samples -- a much
+// shorter fade can cut off mid-cycle and still leave an audible
+// transient) while still being short enough not to read as a deliberate
+// "fade" to the ear. Not needed on any other transition: disabling
+// during RECORDING, or the rising edge itself, are both already
+// passthrough-to-passthrough with nothing discontinuous to smooth.
+#define FX_BEATREPEAT_FADE_SAMPLES 1024u
 
 void fx_beatrepeat_init(void);
 
