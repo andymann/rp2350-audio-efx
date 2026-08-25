@@ -103,15 +103,24 @@
 #define FX_BEATREPEAT_NUM_PATTERNS 16u
 
 // Per-block cap on how much of the record_buf -> loop_buf snapshot copy
-// happens in a single fx_beatrepeat_process_block() call, so triggering
-// never does the whole copy synchronously in one block (see
-// fx_beatrepeat.h's top comment for why that would be a problem). At
-// AUDIO_BUFFER_SAMPLES=192 (4ms blocks @ 48kHz), 8192 completes the
-// default 12-sixteenth loop length in ~9 blocks (~35ms) and the maximum
-// 768000-sample case in ~94 blocks (~375ms) -- both far faster than the
-// old single-buffer design's up-to-full-loop-length fill delay (which,
-// for that same max case, was up to 16 SECONDS).
-#define FX_BEATREPEAT_COPY_CHUNK_SAMPLES 8192u
+// happens in a single fx_beatrepeat_process_block() call, so an extreme
+// (near-maximum) loop length still can't do the whole copy synchronously
+// in one block (see fx_beatrepeat.h's top comment for why that would be
+// a problem). Raised from an earlier, more conservative 8192 -- that
+// value made even the DEFAULT loop length audibly spread across ~9
+// blocks (~35ms), which read as a perceptible delay on triggering. At
+// 96000, the default 12-sixteenth loop length (72000 samples) and
+// anything up to 2 bars completes within a SINGLE block -- no added
+// latency beyond the block's own ~4ms period, same as any other effect.
+// Only loop lengths longer than the chunk (approaching the 768000-sample
+// maximum) still spread across a few blocks (768000/96000 = 8 blocks,
+// ~32ms). The actual per-sample copy cost is now two memcpy() calls
+// rather than a per-element modulo (see fx_beatrepeat.c), which should
+// make this safe against the real-time budget, but PSRAM-to-PSRAM
+// memcpy throughput at the 40MHz QMI clock hasn't been measured on real
+// hardware -- if any delay is still audible (especially at long loop
+// lengths), that's a signal to lower this back down.
+#define FX_BEATREPEAT_COPY_CHUNK_SAMPLES 96000u
 
 void fx_beatrepeat_init(void);
 

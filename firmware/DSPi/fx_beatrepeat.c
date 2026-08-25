@@ -224,15 +224,33 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
 
     // Spread the record_buf -> loop_buf copy across blocks in a bounded
     // chunk per call -- see fx_beatrepeat.h's top comment for why this
-    // can't just be one memcpy done synchronously on the trigger block.
+    // can't just be one memcpy done synchronously on the trigger block
+    // for the worst case, even though it now uses memcpy() internally.
+    // At FX_BEATREPEAT_COPY_CHUNK_SAMPLES=96000, the default 12-sixteenth
+    // loop length (72000 samples) completes within this SINGLE call --
+    // no added latency beyond the block's own ~4ms period, same as any
+    // other effect. Only loop lengths longer than the chunk (approaching
+    // the 768000-sample maximum) still spread across a few blocks.
     if (now_enabled && phase == PHASE_SNAPSHOTTING) {
         uint32_t remaining = loop_len_samples - snapshot_copied;
         uint32_t chunk = remaining < FX_BEATREPEAT_COPY_CHUNK_SAMPLES
                               ? remaining : FX_BEATREPEAT_COPY_CHUNK_SAMPLES;
-        for (uint32_t k = 0; k < chunk; k++) {
-            uint32_t src = (snapshot_src_start + snapshot_copied + k) % FX_BEATREPEAT_MAX_SAMPLES;
-            loop_buf[snapshot_copied + k] = record_buf[src];
+
+        // At most two linear runs to cover the circular source range
+        // [src_start, src_start+chunk) mod SIZE -- avoids a per-element
+        // modulo (each source index computed once here, not once per
+        // sample), letting memcpy() do the actual transfer.
+        uint32_t src_start = (snapshot_src_start + snapshot_copied) % FX_BEATREPEAT_MAX_SAMPLES;
+        uint32_t first_run = FX_BEATREPEAT_MAX_SAMPLES - src_start;
+        if (first_run > chunk) first_run = chunk;
+        memcpy(&loop_buf[snapshot_copied], &record_buf[src_start],
+               first_run * sizeof(int16_t));
+        uint32_t second_run = chunk - first_run;
+        if (second_run > 0u) {
+            memcpy(&loop_buf[snapshot_copied + first_run], &record_buf[0],
+                   second_run * sizeof(int16_t));
         }
+
         snapshot_copied += chunk;
         if (snapshot_copied >= loop_len_samples) {
             phase = PHASE_LOOPING;
