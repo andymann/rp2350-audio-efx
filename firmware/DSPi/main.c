@@ -40,6 +40,8 @@
 #include "fx_control.h"
 #include "fx_delay.h"
 #include "fx_stutter.h"
+#include "fx_phaser.h"
+#include "fx_djfilter.h"
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "loudness.h"
@@ -1926,6 +1928,14 @@ void core0_init() {
     // fx_delay_init() above: no pins to claim, just needs to run before
     // the pipeline starts.
     fx_stutter_init();
+
+    // Reset FX phaser filter state/LFO phase (slot 3). Same ordering
+    // requirement as the others above.
+    fx_phaser_init();
+
+    // Reset FX DJ-filter state (slot 4). Same ordering requirement as the
+    // others above.
+    fx_djfilter_init();
 
     // Onboard LED as a physical PSRAM go/no-go signal: solid on if
     // fx_delay_init() confirmed PSRAM is actually mapped, off if

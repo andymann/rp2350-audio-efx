@@ -41,7 +41,21 @@
  *                         tempo_sync_bar_fraction_samples()). dry_wet =
  *                         gate depth (255 = full silence when muted, 0 =
  *                         no gating effect at all). param2/param3 unused.
- *       3-7 (unassigned)
+ *       3  fx_phaser.c   - tempo-synced 2-notch (4-stage) phaser, 400Hz
+ *                         center, +/-35% LFO sweep at full depth. param1 =
+ *                         LFO rate, 1-14 (musical rate names, not a
+ *                         uniform subdivision -- see fx_phaser.h's
+ *                         PHASER_RATE_TABLE). param2 = sweep depth
+ *                         (0-255 scaled to 0.0-0.35). param3 unused.
+ *                         dry_wet = wet mix.
+ *       4  fx_djfilter.c - DJ-style sweep filter (LP below center, HP
+ *                         above). param1 = cutoff/mode, 0-255 (127 =
+ *                         exact bypass, 0..126 = low-pass sweeping
+ *                         logarithmically closed, 128..255 = high-pass
+ *                         sweeping logarithmically closed). param2 =
+ *                         resonance/Q (0.707-8.0). param3 unused.
+ *                         dry_wet = wet mix.
+ *       5-7 (unassigned)
  *     An unassigned slot's FxState still updates normally via Set FX (the
  *     control plane doesn't know which slots have a DSP effect wired to
  *     them), it just has nothing reading it yet -- same situation slot 0
