@@ -33,12 +33,13 @@
  *                         tempo_sync_step_from_raw()). param2 = feedback,
  *                         dry_wet = wet mix.
  *       1  fx_reverb.c   - tempo-synced pre-delay reverb (4-comb/2-allpass
- *                         Freeverb-style tank, SRAM-resident). param1 =
+ *                         Freeverb-style tank, PSRAM-resident). param1 =
  *                         pre-delay, 0-63 (tempo-synced but hard-capped
  *                         at 150ms regardless of BPM; see
  *                         fx_reverb.h). param2 = decay/size (comb
  *                         feedback, NOT tempo-synced). param3 = damping.
- *                         dry_wet = wet mix.
+ *                         dry_wet = wet mix. Defaults: param1=0x00,
+ *                         param2=0x80, param3=0x40.
  *       2  fx_stutter.c - tempo-synced stutter/gate. param1 = direct count
  *                         of 32nd notes, 1-255 (see fx_stutter.h's
  *                         FX_STUTTER_SUBDIVISIONS_PER_BAR; finer

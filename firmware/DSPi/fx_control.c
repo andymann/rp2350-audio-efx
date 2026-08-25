@@ -272,6 +272,16 @@ static void parse_ring(void) {
 void fx_control_init(void) {
     memset(fx_state, 0, sizeof(fx_state));
 
+    // Slot 1 (fx_reverb.c, FX_REVERB_EFFECT_NUM) ships with non-zero
+    // defaults: param1=0x00 (minimal pre-delay -- already the memset
+    // default, no explicit assignment needed, but noted here for
+    // completeness alongside param2/param3), param2=0x80 (medium decay/
+    // size, roughly the midpoint of FX_REVERB_FEEDBACK_MIN..MAX), param3
+    // =0x40 (light damping, well below FX_REVERB_DAMP_MAX -- a
+    // brighter-leaning starting tail).
+    fx_state[1].param2 = 0x80u;
+    fx_state[1].param3 = 0x40u;
+
     // Slot 3 (fx_phaser.c, FX_PHASER_EFFECT_NUM) ships with non-zero
     // defaults so it's immediately musical the first time it's turned on,
     // without needing a full Set FX command to pick sane values first:
