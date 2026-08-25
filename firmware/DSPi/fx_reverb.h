@@ -7,28 +7,30 @@
  * processing (same convention as fx_delay/fx_stutter/fx_beatrepeat),
  * output applied identically to both channels.
  *
- * Unlike fx_delay/fx_stutter/fx_beatrepeat, every buffer here lives in
- * on-chip SRAM, not PSRAM -- comb/allpass/pre-delay lines for a reverb
- * are all short enough (tens to low hundreds of ms) to fit comfortably,
- * unlike those three effects' much longer buffers. Trimmed to 4 combs +
- * 2 allpasses (half the classic Freeverb 8+4) specifically to keep this
- * effect's SRAM footprint modest -- SRAM is a tight, shared budget
- * across the whole FX chain (~80KB was free before this effect; see
- * fx_delay.h's history for why fx_delay/fx_stutter/fx_beatrepeat all
- * had to move to PSRAM instead of using it). A full 8+4 tank would
- * roughly double this effect's ~41KB SRAM usage for a modestly denser
- * tail; trading some of that density for headroom felt like the right
- * call for a first cut -- doubling FX_REVERB_NUM_COMBS/NUM_ALLPASS and
- * extending the tuning tables is the natural way to revisit that later.
+ * REVISION NOTE: originally kept every buffer in on-chip SRAM (~41KB
+ * total), reasoning that comb/allpass/pre-delay lines for a reverb are
+ * short enough to fit comfortably unlike fx_delay/fx_stutter/
+ * fx_beatrepeat's much longer PSRAM buffers. That halved the shared
+ * SRAM margin (from ~80KB free to ~39KB) and the device failed to boot
+ * on real hardware as a result -- LED never lit, USB never enumerated,
+ * both consistent with a crash early in boot from insufficient stack
+ * headroom. Moved to PSRAM instead, same proven pattern as fx_delay/
+ * fx_beatrepeat (see fx_reverb_psram_ok()) -- PSRAM had ~3.4MB free and
+ * was never actually the constrained resource here.
+ *
+ * Still trimmed to 4 combs + 2 allpasses (half the classic Freeverb
+ * 8+4) rather than restored to the full topology -- PSRAM has room for
+ * either, but there's no reason to reach for more density than a first
+ * cut needs. Doubling FX_REVERB_NUM_COMBS/NUM_ALLPASS and extending the
+ * tuning tables is the natural way to revisit that later.
  *
  * Parameter mapping:
  *   param1  - pre-delay, tempo-synced like every other effect's param1
  *             in this chain, but HARD-CAPPED in absolute time regardless
- *             of BPM (FX_REVERB_PREDELAY_MAX_MS = 150ms) -- unlike
- *             fx_delay/fx_stutter/fx_beatrepeat's buffers, this one
- *             can't be allowed to scale unboundedly with a slow-BPM edge
- *             case, since it has to stay small enough for SRAM. Accepts
- *             0-63 (tempo_sync_clamp1_from_raw(), 0 -> 1 unit, 63 -> 64
+ *             of BPM (FX_REVERB_PREDELAY_MAX_MS = 150ms) -- kept small on
+ *             principle (a pre-delay this long is already unusual) even
+ *             though PSRAM has room to spare. Accepts 0-63
+ *             (tempo_sync_clamp1_from_raw(), 0 -> 1 unit, 63 -> 64
  *             units) of FX_REVERB_PREDELAY_SUBDIVISIONS_PER_BAR
  *             (128ths); anything above 63 is ignored (clamped down), and
  *             the resulting time is separately clamped to the 150ms
@@ -57,6 +59,7 @@
 #define FX_REVERB_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define FX_REVERB_EFFECT_NUM 1u
 
@@ -91,6 +94,11 @@
 #define FX_REVERB_ALLPASS_FEEDBACK 0.5f
 
 void fx_reverb_init(void);
+
+// True iff fx_reverb_init() confirmed every one of this effect's PSRAM
+// buffers (pre-delay + all 4 combs + both allpasses) is actually
+// mapped. Same purpose as fx_delay_psram_ok()/fx_beatrepeat_psram_ok().
+bool fx_reverb_psram_ok(void);
 
 void fx_reverb_process_block(float *out_l, float *out_r, uint32_t sample_count,
                               uint32_t sample_rate_hz);

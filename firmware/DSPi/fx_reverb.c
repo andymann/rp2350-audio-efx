@@ -5,13 +5,26 @@
 #include "fx_reverb.h"
 #include "fx_control.h"
 #include "tempo_sync.h"
-#include "config.h"   // DSP_TIME_CRITICAL
+#include "config.h"                   // DSP_TIME_CRITICAL
+#include "pico/platform/sections.h"   // __uninitialized_psram()
+#include "hardware/psram.h"           // psram_is_available(), psram_check_address()
 #include <string.h>
 
-// Pre-delay: short circular buffer, int16 (like fx_delay's convention)
-// to keep this small even though it's SRAM, not PSRAM -- no reason to
-// spend float-sized storage on a buffer this short-lived.
-static int16_t  predelay_buf[FX_REVERB_PREDELAY_MAX_SAMPLES];
+// PSRAM, not SRAM (see fx_reverb.h's revision note): the tank's ~41KB
+// combined footprint ate too far into the shared on-chip SRAM budget
+// (roughly halved it, from ~80KB free to ~39KB), and the device failed
+// to boot on real hardware after that -- the LED never lit and USB
+// enumeration never happened, both consistent with a crash early in
+// boot from insufficient stack headroom after that SRAM regression.
+// PSRAM was already comfortably under budget (~3.4MB free out of 8MB)
+// and is the proven-safe place for buffers this codebase doesn't
+// strictly need SRAM-speed access for -- same reasoning fx_delay and
+// fx_beatrepeat already followed for their (much larger) buffers.
+
+// Pre-delay: circular buffer, int16 (same as fx_delay's convention) --
+// this one doesn't recirculate through feedback, so a single quantize/
+// dequantize round-trip per sample is fine.
+static int16_t __uninitialized_psram("fx_reverb_predelay") predelay_buf[FX_REVERB_PREDELAY_MAX_SAMPLES];
 static uint32_t predelay_write_pos = 0;
 
 // Comb/allpass tank: fixed lengths, adapted from the classic Freeverb
@@ -19,37 +32,58 @@ static uint32_t predelay_write_pos = 0;
 // trimmed from Freeverb's 8 combs/4 allpasses down to 4/2 -- see
 // fx_reverb.h's top comment for why). Every-other value kept from the
 // original 8, to preserve reasonable spacing/decorrelation between the
-// four that remain.
+// four that remain. Float, not int16, unlike the pre-delay buffer above:
+// comb/allpass samples recirculate through feedback many times per
+// second of decay, so a per-cycle int16 quantize/dequantize round-trip
+// would compound quantization noise over the tail in a way a single
+// non-recirculating delay tap doesn't risk.
+#define FX_REVERB_COMB_LEN_0 1215u
+#define FX_REVERB_COMB_LEN_1 1390u
+#define FX_REVERB_COMB_LEN_2 1548u
+#define FX_REVERB_COMB_LEN_3 1695u
+#define FX_REVERB_ALLPASS_LEN_0 605u
+#define FX_REVERB_ALLPASS_LEN_1 480u
+
 static const uint32_t FX_REVERB_COMB_LENGTHS[FX_REVERB_NUM_COMBS] = {
-    1215, 1390, 1548, 1695
+    FX_REVERB_COMB_LEN_0, FX_REVERB_COMB_LEN_1, FX_REVERB_COMB_LEN_2, FX_REVERB_COMB_LEN_3
 };
 static const uint32_t FX_REVERB_ALLPASS_LENGTHS[FX_REVERB_NUM_ALLPASS] = {
-    605, 480
+    FX_REVERB_ALLPASS_LEN_0, FX_REVERB_ALLPASS_LEN_1
 };
 
-// Comb state: own buffer, write index, and one-pole lowpass "filterstore"
-// (damping) per comb. Buffers sized to each comb's own fixed length
-// (not a shared MAX_SAMPLES-style array) since these never change size
-// at runtime, unlike the tempo-synced buffers elsewhere in this chain.
-static float comb_buf_0[1215];
-static float comb_buf_1[1390];
-static float comb_buf_2[1548];
-static float comb_buf_3[1695];
+static float __uninitialized_psram("fx_reverb_comb0") comb_buf_0[FX_REVERB_COMB_LEN_0];
+static float __uninitialized_psram("fx_reverb_comb1") comb_buf_1[FX_REVERB_COMB_LEN_1];
+static float __uninitialized_psram("fx_reverb_comb2") comb_buf_2[FX_REVERB_COMB_LEN_2];
+static float __uninitialized_psram("fx_reverb_comb3") comb_buf_3[FX_REVERB_COMB_LEN_3];
 static float * const comb_bufs[FX_REVERB_NUM_COMBS] = {
     comb_buf_0, comb_buf_1, comb_buf_2, comb_buf_3
 };
 static uint32_t comb_pos[FX_REVERB_NUM_COMBS];
 static float    comb_filterstore[FX_REVERB_NUM_COMBS];
 
-static float allpass_buf_0[605];
-static float allpass_buf_1[480];
+static float __uninitialized_psram("fx_reverb_ap0") allpass_buf_0[FX_REVERB_ALLPASS_LEN_0];
+static float __uninitialized_psram("fx_reverb_ap1") allpass_buf_1[FX_REVERB_ALLPASS_LEN_1];
 static float * const allpass_bufs[FX_REVERB_NUM_ALLPASS] = {
     allpass_buf_0, allpass_buf_1
 };
 static uint32_t allpass_pos[FX_REVERB_NUM_ALLPASS];
 
+static bool psram_ok = false;
+
 void fx_reverb_init(void)
 {
+    psram_ok = psram_is_available() &&
+               psram_check_address(&predelay_buf[FX_REVERB_PREDELAY_MAX_SAMPLES - 1]) &&
+               psram_check_address(&comb_buf_0[FX_REVERB_COMB_LEN_0 - 1]) &&
+               psram_check_address(&comb_buf_1[FX_REVERB_COMB_LEN_1 - 1]) &&
+               psram_check_address(&comb_buf_2[FX_REVERB_COMB_LEN_2 - 1]) &&
+               psram_check_address(&comb_buf_3[FX_REVERB_COMB_LEN_3 - 1]) &&
+               psram_check_address(&allpass_buf_0[FX_REVERB_ALLPASS_LEN_0 - 1]) &&
+               psram_check_address(&allpass_buf_1[FX_REVERB_ALLPASS_LEN_1 - 1]);
+    if (!psram_ok) {
+        return;   // do not touch any buffer -- see fx_delay.c's identical guard rationale
+    }
+
     memset(predelay_buf, 0, sizeof(predelay_buf));
     predelay_write_pos = 0;
 
@@ -62,6 +96,11 @@ void fx_reverb_init(void)
         memset(allpass_bufs[a], 0, FX_REVERB_ALLPASS_LENGTHS[a] * sizeof(float));
         allpass_pos[a] = 0;
     }
+}
+
+bool fx_reverb_psram_ok(void)
+{
+    return psram_ok;
 }
 
 // Classic damped-comb step (Freeverb topology): read the delayed sample,
@@ -93,11 +132,17 @@ static inline float allpass_process(float *buf, uint32_t len, uint32_t *pos, flo
 }
 
 // RAM-resident for the same reason as the other FX process-block
-// functions (see fx_delay.c's comment): shares the per-sample hot path.
+// functions (see fx_delay.c's comment): shares the per-sample hot path,
+// AND (now that its buffers moved to PSRAM) for the same PSRAM/flash
+// QMI-bus-contention reason fx_delay's code needed it.
 DSP_TIME_CRITICAL
 void fx_reverb_process_block(float *out_l, float *out_r, uint32_t sample_count,
                               uint32_t sample_rate_hz)
 {
+    if (!psram_ok) {
+        return;   // PSRAM not confirmed present/mapped -- see fx_delay.c's identical guard
+    }
+
     FxState st;
     if (!fx_control_get(FX_REVERB_EFFECT_NUM, &st) || !st.enabled) {
         return;   // slot off or unavailable: passthrough, tank state ages silently
