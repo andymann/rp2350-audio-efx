@@ -16,13 +16,15 @@
  * this effect uses the generic bar-fraction one, NOT the same one
  * fx_delay uses):
  *   param1  - time division, a direct count of FX_STUTTER_SUBDIVISIONS_PER_BAR-
- *             note units (currently 32nd notes; 1-255, via
- *             tempo_sync_bar_fraction_samples() against
- *             fx_control_get_bpm()) -- param1=1 means 1/32 of a bar,
- *             param1=32 means a full bar, param1=64 means 2 bars. This is
- *             the length of BOTH the open and the muted half of the
- *             cycle -- param1=1 means 1/32 bar passes through, then 1/32
- *             bar is silent, repeating (a full cycle is 2/32 bar).
+ *             note units (currently 32nd notes). ACCEPTS 0-63 over the
+ *             wire, mapping to 1-64 units via tempo_sync_clamp1_from_raw()
+ *             (0 -> 1 unit, 63 -> 64 units); anything above 63 is
+ *             ignored (clamped down to 63). param1=0 (1 unit) means 1/32
+ *             of a bar, param1=31 (32 units) means a full bar, param1=63
+ *             (64 units) means 2 bars. This is the length of BOTH the
+ *             open and the muted half of the cycle -- 1 unit means 1/32
+ *             bar passes through, then 1/32 bar is silent, repeating (a
+ *             full cycle is 2/32 bar).
  *             Finer resolution than fx_delay's 16-step scheme on purpose:
  *             that scheme's shortest interval is a quarter note, too
  *             coarse for a stutter gate. This has already been tightened

@@ -30,8 +30,13 @@ void fx_stutter_process_block(float *out_l, float *out_r, uint32_t sample_count,
     }
 
     uint16_t bpm_x100 = fx_control_get_bpm();
+    // param1 accepts 0-63, mapping to 1-64 units (see
+    // tempo_sync_clamp1_from_raw()'s doc); anything above 63 is ignored
+    // (clamped down to 63, i.e. 64 units -- 2 bars at the current
+    // FX_STUTTER_SUBDIVISIONS_PER_BAR=32).
+    uint8_t n = tempo_sync_clamp1_from_raw(st.param1, 63u);
     uint32_t interval_samples = tempo_sync_bar_fraction_samples(
-        st.param1, FX_STUTTER_SUBDIVISIONS_PER_BAR, bpm_x100, sample_rate_hz);
+        n, FX_STUTTER_SUBDIVISIONS_PER_BAR, bpm_x100, sample_rate_hz);
     if (interval_samples < 1u) interval_samples = 1u;
 
     uint32_t cycle_len = interval_samples * 2u;

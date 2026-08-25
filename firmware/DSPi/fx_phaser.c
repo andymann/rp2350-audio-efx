@@ -84,8 +84,13 @@ void fx_phaser_process_block(float *out_l, float *out_r, uint32_t sample_count,
 
     uint16_t bpm_x100 = fx_control_get_bpm();
 
-    uint8_t rate_step = st.param1;
-    if (rate_step < 1u) rate_step = 1u;
+    // param1 accepts 0-63 over the wire (tempo_sync_clamp1_from_raw()),
+    // giving 1-64; only the first PHASER_RATE_STEPS (14) of those
+    // correspond to real table entries, so anything from 14 up through
+    // 63 (and, before the outer clamp, 64-255 too) all land on the same
+    // last entry -- functionally identical to a plain 0-13 accepted
+    // range, just satisfying "accepts 0-63" at the wire level.
+    uint8_t rate_step = tempo_sync_clamp1_from_raw(st.param1, 63u);
     if (rate_step > PHASER_RATE_STEPS) rate_step = (uint8_t)PHASER_RATE_STEPS;
     const RateEntry *rate = &PHASER_RATE_TABLE[rate_step - 1u];
 

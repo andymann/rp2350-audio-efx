@@ -206,9 +206,17 @@ void fx_beatrepeat_process_block(float *out_l, float *out_r, uint32_t sample_cou
     if (rising_edge) {
         // Lock in the loop length for this session from param1 + current
         // BPM; changes to either afterward only take effect on the NEXT
-        // enable-edge.
+        // enable-edge. param1 accepts 0-(FX_BEATREPEAT_MAX_SIXTEENTHS-1)
+        // over the wire, mapping to 1-FX_BEATREPEAT_MAX_SIXTEENTHS
+        // sixteenths via tempo_sync_clamp1_from_raw(); anything above
+        // that is ignored (clamped down). This lines up exactly with the
+        // existing FX_BEATREPEAT_MAX_SIXTEENTHS buffer-sizing constant --
+        // the raw-byte clamp and the buffer's practical ceiling are now
+        // the same number, not just coincidentally related via a
+        // downstream samples clamp like before.
         uint16_t bpm_x100 = fx_control_get_bpm();
-        uint32_t len = tempo_sync_bar_fraction_samples(st.param1, 16u, bpm_x100, sample_rate_hz);
+        uint8_t n = tempo_sync_clamp1_from_raw(st.param1, (uint8_t)(FX_BEATREPEAT_MAX_SIXTEENTHS - 1u));
+        uint32_t len = tempo_sync_bar_fraction_samples(n, 16u, bpm_x100, sample_rate_hz);
         if (len < 1u) len = 1u;
         if (len > FX_BEATREPEAT_MAX_SAMPLES) len = FX_BEATREPEAT_MAX_SAMPLES;
         loop_len_samples = len;

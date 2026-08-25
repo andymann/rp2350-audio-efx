@@ -275,11 +275,15 @@ void fx_control_init(void) {
     // Slot 3 (fx_phaser.c, FX_PHASER_EFFECT_NUM) ships with non-zero
     // defaults so it's immediately musical the first time it's turned on,
     // without needing a full Set FX command to pick sane values first:
-    // param1=0x06 (quarter-note LFO rate), param2=0xC0 (~75% sweep depth,
+    // param1=0x05 (quarter-note LFO rate), param2=0xC0 (~75% sweep depth,
     // 192/255). Still off (enabled=0, same as every other slot) until an
     // explicit Set FX turns it on -- this only pre-loads param1/param2,
-    // it doesn't start the effect running at boot.
-    fx_state[3].param1 = 0x06u;
+    // it doesn't start the effect running at boot. param1=0x05 here
+    // (not 0x06) because param1's accepted range later shifted to 0-63
+    // (0 -> rate table entry 1, ...) -- 0x05 still lands on the same
+    // quarter-note table entry the original 0x06 did under the old
+    // 1-indexed (1-14, no shift) mapping.
+    fx_state[3].param1 = 0x05u;
     fx_state[3].param2 = 0xC0u;
 
     // Slot 4 (fx_djfilter.c, FX_DJFILTER_EFFECT_NUM) similarly ships with
@@ -291,12 +295,16 @@ void fx_control_init(void) {
     fx_state[4].param2 = 0x40u;
 
     // Slot 5 (fx_beatrepeat.c, FX_BEATREPEAT_EFFECT_NUM) ships with its
-    // spec'd default: param1=12 (0.75 bar loop length). param2 (playback
-    // order) defaults to 0 (normal/forward) already via the memset above
-    // -- no explicit assignment needed, but noted here since it used to
-    // be a different parameter (slice count, previously defaulted to 4)
-    // before the param2/param3 rework.
-    fx_state[5].param1 = 12u;
+    // spec'd default: param1=11 (0.75 bar loop length -- 12 sixteenths).
+    // param2 (playback order) defaults to 0 (normal/forward) already via
+    // the memset above -- no explicit assignment needed, but noted here
+    // since it used to be a different parameter (slice count, previously
+    // defaulted to 4) before the param2/param3 rework. param1=11 here
+    // (not 12) for the same reason as slot 3's param1 above -- param1's
+    // accepted range shifted to 0-63 (0 -> 1 sixteenth, ...), and 11
+    // still lands on the originally-intended 12-sixteenth (0.75 bar)
+    // loop length under the new mapping.
+    fx_state[5].param1 = 11u;
 
     bpm_x100 = BPM_X100_DEFAULT;
     reset_parser();

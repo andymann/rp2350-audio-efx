@@ -6,18 +6,32 @@
 #include "config.h"   // DSP_TIME_CRITICAL
 
 DSP_TIME_CRITICAL
+uint8_t tempo_sync_clamp1_from_raw(uint8_t raw, uint8_t max_accepted)
+{
+    // Shared "0-indexed wire value -> 1-indexed internal value" pattern:
+    // the raw byte's ACCEPTED range is [0, max_accepted]; anything above
+    // max_accepted clamps down to it rather than being refused (same
+    // clamp-not-refuse policy used throughout this codebase). The
+    // returned value is raw+1, so 0 maps to 1 (never 0 -- callers that
+    // use this as a step/count/index generally can't do anything
+    // meaningful with a literal 0). max_accepted must be < 255 so the
+    // +1 below can't overflow a uint8_t.
+    if (raw > max_accepted) raw = max_accepted;
+    return (uint8_t)(raw + 1u);
+}
+
+DSP_TIME_CRITICAL
 uint8_t tempo_sync_step_from_raw(uint8_t raw)
 {
-    // param1 IS the step number directly (1-16), clamped at the edges --
-    // not a raw 0-255 byte bucketed into 16 ranges. An earlier revision of
-    // this function did that bucketing ((raw >> 4) + 1), which meant
-    // param1 values 0x00-0x0F all mapped to step 1: confusing when setting
-    // param1 by hand over the FX UART, where sending literal 1, 2, 3...
-    // is the natural way to pick a step. 0 clamps up to step 1 (not an
-    // error -- there's no reason to refuse it) rather than down to 0.
-    if (raw < 1u) return 1u;
-    if (raw > TEMPO_SYNC_STEPS) return (uint8_t)TEMPO_SYNC_STEPS;
-    return raw;
+    // param1's ACCEPTED range is 0-15 (16 values), mapping directly to
+    // steps 1-16 -- 0 is step 1, 15 is step 16, and anything above 15 is
+    // ignored (clamped down to 15, i.e. step 16). An earlier revision of
+    // this function accepted 1-16 directly (no shift); changed so 0 is a
+    // valid, meaningful first option rather than being clamped up to 1,
+    // and raw values above the new 15 ceiling are explicitly ignored
+    // rather than silently still doing something (they all just land on
+    // step 16, same as raw=15).
+    return tempo_sync_clamp1_from_raw(raw, 15u);
 }
 
 DSP_TIME_CRITICAL
