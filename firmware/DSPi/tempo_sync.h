@@ -15,9 +15,11 @@
  *              (1 = 1/4, 2 = 2/4, ... 8 = 8/4 == 2 bars)
  *       9-16 : the same 8 lengths again, as triplets
  *              (9 = 1/4 triplet, ... 16 = 8/4 triplet)
- *     param1's raw byte value over the wire IS the step number directly
- *     (1-16); tempo_sync_step_from_raw() clamps it at the edges (0 -> 1,
- *     17-255 -> 16) rather than mapping it. Used by fx_delay.
+ *     param1's raw byte value ACCEPTS 0-15 over the wire, mapping
+ *     directly to steps 1-16 (0 -> step 1, 15 -> step 16);
+ *     tempo_sync_step_from_raw() clamps anything above 15 down to 15
+ *     (step 16) rather than mapping it -- effectively ignoring the rest
+ *     of the raw byte's range. Used by fx_delay.
  *
  *     A triplet duration is 2/3 of the straight duration at the same step
  *     number (n): fitting 3 notes in the space of 2 straight ones is the
@@ -50,8 +52,19 @@
 
 #define TEMPO_SYNC_STEPS 16
 
-// Clamp param1's raw byte value into the 1-16 tempo-sync step range (the
-// byte value IS the step number directly; this just guards the edges).
+// Shared "raw wire byte -> 1-indexed internal value" clamp: accepts
+// [0, max_accepted] and returns raw+1 (0 -> 1, max_accepted ->
+// max_accepted+1); anything above max_accepted clamps down to it first
+// (ignored, same as sending max_accepted itself). max_accepted must be
+// < 255 (the +1 would otherwise overflow a uint8_t). Used by
+// tempo_sync_step_from_raw() and directly by effects that need this
+// same "accept 0-N, ignore above" pattern for their own param1 range
+// (see fx_stutter.c, fx_phaser.c, fx_beatrepeat.c).
+uint8_t tempo_sync_clamp1_from_raw(uint8_t raw, uint8_t max_accepted);
+
+// Clamp param1's raw byte value (0-15 accepted) into the 1-16 tempo-sync
+// step range -- see tempo_sync_clamp1_from_raw() for the general pattern
+// this is built on.
 uint8_t tempo_sync_step_from_raw(uint8_t raw);
 
 // Duration of the given step (1-16) at the given tempo. bpm_x100 uses the

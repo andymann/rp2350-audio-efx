@@ -18,14 +18,19 @@
  *                           full param2 depth (see param2 below).
  *
  * Parameter mapping:
- *   param1  - LFO rate, one of 14 values (1-14, clamped at the edges).
- *             Each value is the LFO's full sweep period as an exact bar
- *             fraction, computed via tempo_sync_bar_fraction_ms() against
- *             fx_control_get_bpm() -- reuses the same generic function
- *             fx_stutter uses, just with a lookup table of (n,
- *             subdivisions_per_bar) pairs instead of one fixed
- *             subdivisions_per_bar (see PHASER_RATE_TABLE in fx_phaser.c
- *             for the derivation of each pair):
+ *   param1  - LFO rate, one of 14 values. ACCEPTS 0-63 over the wire
+ *             (tempo_sync_clamp1_from_raw(), 0 -> value 1, 63 -> value
+ *             64); only values 1-14 correspond to a real rate table
+ *             entry, values 14 up through 63 (and, before the outer
+ *             clamp, everything above 63) all land on the last table
+ *             entry (value 14, fastest rate). Each value is the LFO's
+ *             full sweep period as an exact bar fraction, computed via
+ *             tempo_sync_bar_fraction_ms() against fx_control_get_bpm()
+ *             -- reuses the same generic function fx_stutter uses, just
+ *             with a lookup table of (n, subdivisions_per_bar) pairs
+ *             instead of one fixed subdivisions_per_bar (see
+ *             PHASER_RATE_TABLE in fx_phaser.c for the derivation of
+ *             each pair):
  *               1: 2 bars      6: 1/4 bar (quarter)    11: 1/16 bar
  *               2: 1 bar       7: 3/16 bar (dotted 8th) 12: 3/64 bar
  *               3: 3/4 bar     8: 1/8 bar (eighth)      13: 1/24 bar (trip. 16th)

@@ -48,9 +48,12 @@
  * Parameter mapping (param3 reworked -- see below; param1/param2/dry_wet
  * unchanged from the previous revision):
  *   param1  - loop length, number of 16ths of a bar (NOT fx_stutter's
- *             32nds convention). tempo_sync_bar_fraction_ms(param1, 16,
- *             bpm_x100). Clamped to FX_BEATREPEAT_MAX_SIXTEENTHS (64 = 4
- *             bars). Default 12 (0.75 bar).
+ *             32nds convention). ACCEPTS 0-63 over the wire, mapping to
+ *             1-64 sixteenths via tempo_sync_clamp1_from_raw() (0 -> 1
+ *             sixteenth, 63 -> 64 sixteenths = 4 bars); anything above
+ *             63 is ignored (clamped down). tempo_sync_bar_fraction_ms()
+ *             call uses the mapped 1-64 value, not raw param1 directly.
+ *             Default 11 (-> 12 sixteenths = 0.75 bar).
  *   param2  - playback order, 0-15 (clamped at the edges). 0 is normal
  *             (forward) playback. See PLAYBACK ORDERS below. Default 0.
  *   param3  - live gain: how much of the INCOMING (pre-effect) signal is
