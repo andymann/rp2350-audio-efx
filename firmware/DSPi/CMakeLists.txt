@@ -111,9 +111,5 @@ target_link_libraries(DSPi
 # Debug UART removed; GPIO 16/17 are freed for the FX UART control
 # interface (fx_control.c).
 pico_enable_stdio_uart(DSPi 0)
-# pico_stdio_uart is linked for stdio_uart_init_full() in main.c, which
-# initializes UART1 -- required for reliable USB enumeration (see that
-# call site's comment); not used for any actual console output here.
-target_link_libraries(DSPi pico_stdio_uart)
 
 pico_add_extra_outputs(DSPi)
