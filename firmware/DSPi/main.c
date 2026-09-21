@@ -20,13 +20,10 @@
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
 #include "pico/audio.h"
-#include "pico/stdio_uart.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
 #include "hardware/structs/bus_ctrl.h"
 #include "hardware/gpio.h"
-
-#include <stdio.h>
 
 #include "tusb.h"
 
@@ -85,17 +82,6 @@ static void core0_init(void)
     set_sys_clock_pll(1536000000, 5, 1);
 #endif
 
-    // TEMPORARY debug console (UART1, GPIO 4/5 -- doesn't conflict with
-    // fx_control.c's dedicated FX UART, which uses UART0 on GPIO 16/17)
-    // to diagnose a USB enumeration failure that isn't visible from the
-    // boot LED alone. Initialized AFTER the system clock change above,
-    // not before: stdio_uart_init_full() computes its baud-rate divisor
-    // from the clock speed in effect when it's called, so doing this any
-    // earlier would produce garbled output once set_sys_clock_hz() runs.
-    stdio_uart_init_full(uart1, 115200, 4, 5);
-    printf("\n\n=== DSPi minimal build booting ===\n");
-    printf("sys_clk = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
-
     pico_get_unique_board_id_string(usb_descriptor_str_serial, 17);
 
     // Carried over unchanged from the original main.c, which set this
@@ -129,23 +115,16 @@ static void core0_init(void)
     // particular appears to be strict enough about enumeration timing
     // that steady I2S DMA IRQ load already running during the initial
     // SETUP/DATA/STATUS exchange was enough to prevent it from ever
-    // completing. (This reorder alone did not fix the reported failure --
-    // the trace prints below are here to find out why not.)
-    printf("calling usb_sound_card_init()...\n");
+    // completing.
     usb_sound_card_init();
-    printf("usb_sound_card_init() returned. tusb_inited()=%d\n", (int)tusb_inited());
 
     // I2S output before I2S input: the input's receiver PIO program
     // watches BCK/LRCLK pads that only carry a real clock once the
     // output side is driving them (see i2s_input.h's top comment). This
     // relationship is independent of the USB-ordering fix above and
     // still holds.
-    printf("calling i2s_output_init()...\n");
     i2s_output_init();
-    printf("i2s_output_init() returned.\n");
-    printf("calling i2s_input_init()...\n");
     i2s_input_init();
-    printf("i2s_input_init() returned.\n");
 
     // FX chain. fx_control_init() (the dedicated FX UART) must run
     // before any fx_*_init() that could touch PSRAM, matching this
@@ -166,12 +145,8 @@ static void core0_init(void)
     // list since they don't use PSRAM and have no psram_ok() of their own.
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    bool psram_ok = fx_delay_psram_ok() && fx_reverb_psram_ok() && fx_beatrepeat_psram_ok();
-    gpio_put(PICO_DEFAULT_LED_PIN, psram_ok);
-    printf("PSRAM ok: delay=%d reverb=%d beatrepeat=%d -> LED=%d\n",
-           (int)fx_delay_psram_ok(), (int)fx_reverb_psram_ok(),
-           (int)fx_beatrepeat_psram_ok(), (int)psram_ok);
-    printf("=== core0_init() complete, entering main loop ===\n");
+    gpio_put(PICO_DEFAULT_LED_PIN,
+             fx_delay_psram_ok() && fx_reverb_psram_ok() && fx_beatrepeat_psram_ok());
 }
 
 int main(void)
@@ -180,35 +155,15 @@ int main(void)
 
     audio_buffer_pool_t *out_pool = i2s_output_pool();
 
-    uint32_t loop_count = 0;
-    uint32_t last_status_ms = 0;
-
     while (true) {
         tud_task();
-
-        // Periodic status print (~once/sec) so USB mount/connect state is
-        // visible over time without flooding the console -- tud_mounted()
-        // in particular tells us whether the HOST believes SET_CONFIGURATION
-        // has completed (i.e. enumeration succeeded from TinyUSB's own
-        // point of view), independent of whatever the OS's UI shows.
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (now_ms - last_status_ms >= 1000) {
-            last_status_ms = now_ms;
-            printf("[%lums] loop=%lu tud_mounted=%d tud_connected=%d tud_suspended=%d\n",
-                   (unsigned long)now_ms, (unsigned long)loop_count,
-                   (int)tud_mounted(), (int)tud_connected(), (int)tud_suspended());
-        }
 
         // Blocking take: normally returns quickly, since the output DMA
         // is steadily consuming and returning buffers to the free list
         // at a fixed ~4ms cadence (AUDIO_BUFFER_SAMPLES @ SAMPLE_RATE_HZ).
         // tud_task() above still runs at least once per loop iteration
-        // regardless of how long this blocks. TEMPORARY: the first call
-        // is preceded/followed by a print so a hang here (which would
-        // otherwise look identical to slow/silent USB) is unambiguous.
-        if (loop_count == 0) printf("about to call take_audio_buffer() for the first time...\n");
+        // regardless of how long this blocks.
         audio_buffer_t *buf = take_audio_buffer(out_pool, true);
-        if (loop_count == 0) printf("take_audio_buffer() returned (first call).\n");
         if (!buf) continue;
 
         uint32_t frames = buf->max_sample_count;
@@ -218,7 +173,6 @@ int main(void)
         buf->sample_count = frames;
 
         give_audio_buffer(out_pool, buf);
-        loop_count++;
     }
 
     return 0;

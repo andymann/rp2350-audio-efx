@@ -110,13 +110,6 @@ target_link_libraries(DSPi
 
 # Debug UART removed; GPIO 16/17 are freed for the FX UART control
 # interface (fx_control.c).
-# Debug console temporarily re-enabled on UART1 (GPIO 4/5 -- fx_control.c's
-# dedicated FX UART uses UART0 on GPIO 16/17, so this doesn't conflict) to
-# diagnose a USB-enumeration failure that isn't visible from the boot LED
-# alone. main.c calls stdio_uart_init_full() explicitly rather than
-# relying on pico_enable_stdio_uart's default pin choice, so the pins used
-# are unambiguous here rather than implied by board defaults.
 pico_enable_stdio_uart(DSPi 0)
-target_link_libraries(DSPi pico_stdio_uart)
 
 pico_add_extra_outputs(DSPi)

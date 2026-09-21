@@ -152,7 +152,6 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
 }
 
 static void uac1_driver_init(void) {
-    printf("uac1_driver_init() called\n");
     memset(&uac1, 0, sizeof(uac1));
 }
 
@@ -162,7 +161,6 @@ static bool uac1_driver_deinit(void) {
 
 static void uac1_driver_reset(uint8_t rhport) {
     (void)rhport;
-    printf("uac1_driver_reset() called\n");
     uac1.ep_data_open = false;
     uac1.ep_fb_open = false;
     uac1.cur_alt = 0;
@@ -171,10 +169,6 @@ static void uac1_driver_reset(uint8_t rhport) {
 
 static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
     (void)rhport;
-
-    printf("uac1_driver_open: itf=%d class=0x%02x subclass=0x%02x alt=%d max_len=%d\n",
-           itf_desc->bInterfaceNumber, itf_desc->bInterfaceClass,
-           itf_desc->bInterfaceSubClass, itf_desc->bAlternateSetting, (int)max_len);
 
     TU_VERIFY(itf_desc->bInterfaceClass == TUSB_CLASS_AUDIO);
     TU_VERIFY(itf_desc->bInterfaceSubClass == AUDIO_SUBCLASS_CONTROL);
@@ -232,8 +226,6 @@ static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *it
     }
 
     usbd_sof_enable(rhport, SOF_CONSUMER_AUDIO, true);
-    printf("uac1_driver_open: returning drv_len=%d (ac_itf=%d as_itf=%d)\n",
-           (int)drv_len, uac1.ac_itf, uac1.as_itf);
     return drv_len;
 }
 
@@ -333,9 +325,6 @@ static bool uac1_handle_ep_get(uint8_t rhport, tusb_control_request_t const *req
 
 static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     if (stage == CONTROL_STAGE_SETUP) {
-        printf("ctrl_xfer SETUP: bmRequestType=0x%02x type=%d recipient=%d dir=%d bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d\n",
-               req->bmRequestType, req->bmRequestType_bit.type, req->bmRequestType_bit.recipient,
-               req->bmRequestType_bit.direction, req->bRequest, req->wValue, req->wIndex, req->wLength);
         if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
             if (req->bRequest == TUSB_REQ_SET_INTERFACE) {
                 uint8_t itf = TU_U16_LOW(req->wIndex);
@@ -477,6 +466,25 @@ void usb_sound_card_init(void) {
     // async feedback encoding.
     nominal_feedback_10_14 = (uint32_t)(((uint64_t)SAMPLE_RATE_HZ << 14) / 1000u);
 
-    bool init_ok = tusb_init();
-    printf("tusb_init() returned %d\n", (int)init_ok);
+    tusb_init();
+
+    // Brief settle delay after USB stack init, before anything else in
+    // boot touches the bus or starts other DMA/PIO activity. Added after
+    // a reported enumeration failure on macOS (device booted fine --
+    // LED confirmed -- but never appeared as any USB device) turned out
+    // to be a timing-sensitive issue: a diagnostic build with printf()
+    // tracing sprinkled through the whole SETUP-handling path (each
+    // print costing a few ms over a 115200-baud debug UART) enumerated
+    // successfully every time, all the way through SET_CONFIGURATION,
+    // interface open, and volume/frequency control negotiation. Removing
+    // the tracing reproduced the original failure, confirming a real
+    // race rather than a descriptor or driver-logic bug (which had
+    // already been verified byte-correct and logically correct via that
+    // same tracing). This is the minimal, targeted version of "give it
+    // time to settle" rather than leaving debug-print latency in the
+    // shipped firmware -- if 2ms here isn't sufficient on its own, the
+    // race is more likely to be about spacing between individual SETUP
+    // responses than a one-time post-init settle window, which would
+    // need a different fix.
+    sleep_ms(2);
 }

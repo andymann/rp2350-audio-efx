@@ -268,16 +268,12 @@ const uint8_t *const usb_audio_fb_ep_desc   = &usb_config_descriptor[OFFSET_ALT1
 // TinyUSB descriptor callbacks
 // ----------------------------------------------------------------------------
 
-#include <stdio.h>
-
 uint8_t const *tud_descriptor_device_cb(void) {
-    printf("tud_descriptor_device_cb() called\n");
     return (uint8_t const *)&device_descriptor;
 }
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
-    printf("tud_descriptor_configuration_cb(index=%d) called\n", (int)index);
     return usb_config_descriptor;
 }
 
@@ -285,7 +281,6 @@ static uint16_t string_response[32];
 
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void)langid;
-    printf("tud_descriptor_string_cb(index=%d) called\n", (int)index);
 
     if (index == STRID_LANGID) {
         string_response[0] = (TUSB_DESC_STRING << 8) | 4;
