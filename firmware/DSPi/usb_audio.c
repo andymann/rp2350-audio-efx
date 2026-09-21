@@ -152,6 +152,7 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
 }
 
 static void uac1_driver_init(void) {
+    printf("uac1_driver_init() called\n");
     memset(&uac1, 0, sizeof(uac1));
 }
 
@@ -161,6 +162,7 @@ static bool uac1_driver_deinit(void) {
 
 static void uac1_driver_reset(uint8_t rhport) {
     (void)rhport;
+    printf("uac1_driver_reset() called\n");
     uac1.ep_data_open = false;
     uac1.ep_fb_open = false;
     uac1.cur_alt = 0;
@@ -169,6 +171,10 @@ static void uac1_driver_reset(uint8_t rhport) {
 
 static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
     (void)rhport;
+
+    printf("uac1_driver_open: itf=%d class=0x%02x subclass=0x%02x alt=%d max_len=%d\n",
+           itf_desc->bInterfaceNumber, itf_desc->bInterfaceClass,
+           itf_desc->bInterfaceSubClass, itf_desc->bAlternateSetting, (int)max_len);
 
     TU_VERIFY(itf_desc->bInterfaceClass == TUSB_CLASS_AUDIO);
     TU_VERIFY(itf_desc->bInterfaceSubClass == AUDIO_SUBCLASS_CONTROL);
@@ -226,6 +232,8 @@ static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *it
     }
 
     usbd_sof_enable(rhport, SOF_CONSUMER_AUDIO, true);
+    printf("uac1_driver_open: returning drv_len=%d (ac_itf=%d as_itf=%d)\n",
+           (int)drv_len, uac1.ac_itf, uac1.as_itf);
     return drv_len;
 }
 
@@ -325,6 +333,9 @@ static bool uac1_handle_ep_get(uint8_t rhport, tusb_control_request_t const *req
 
 static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     if (stage == CONTROL_STAGE_SETUP) {
+        printf("ctrl_xfer SETUP: bmRequestType=0x%02x type=%d recipient=%d dir=%d bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d\n",
+               req->bmRequestType, req->bmRequestType_bit.type, req->bmRequestType_bit.recipient,
+               req->bmRequestType_bit.direction, req->bRequest, req->wValue, req->wIndex, req->wLength);
         if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
             if (req->bRequest == TUSB_REQ_SET_INTERFACE) {
                 uint8_t itf = TU_U16_LOW(req->wIndex);
