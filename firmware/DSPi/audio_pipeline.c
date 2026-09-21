@@ -49,8 +49,18 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
     i2s_input_poll(i2s_l, i2s_r, sample_count);
 
     for (uint32_t i = 0; i < sample_count; i++) {
-        float l = usb_l[i] + i2s_l[i];
-        float r = usb_r[i] + i2s_r[i];
+        // Attenuate by half (-6dB) before summing, not after: if both
+        // sources are simultaneously near full-scale (0dBFS, common for
+        // real digital sources -- USB audio and a hot I2S line both
+        // routinely hit this), a straight sum-then-hard-clamp clips on
+        // nearly every sample, which is audibly harsh, bitcrusher-like
+        // digital distortion, not the occasional overs a limiter would
+        // produce. Halving first means even the worst case (+1.0 and
+        // +1.0) lands exactly at +1.0, needing no clipping at all in
+        // ordinary use -- the safety clamp below exists only for a
+        // source that's already out of [-1, 1] before it reaches here.
+        float l = usb_l[i] * 0.5f + i2s_l[i] * 0.5f;
+        float r = usb_r[i] * 0.5f + i2s_r[i] * 0.5f;
         if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
         if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
         mix_l[i] = l;
