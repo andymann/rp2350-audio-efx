@@ -22,6 +22,7 @@
 #include "pico/audio.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
+#include "hardware/irq.h"
 #include "hardware/structs/bus_ctrl.h"
 #include "hardware/gpio.h"
 
@@ -101,6 +102,30 @@ static void core0_init(void)
     // every PSRAM-backed FX effect's QMI traffic).
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
 
+    // USB IRQ given explicit priority ABOVE its default (0x80, same as
+    // every other IRQ including the I2S output's DMA IRQ -- see
+    // hardware_irq's PICO_DEFAULT_IRQ_PRIORITY). Added after confirming,
+    // via a diagnostic build with printf() tracing throughout the whole
+    // SETUP-handling path, that the underlying descriptor/driver logic
+    // is genuinely correct (full enumeration succeeded reliably with
+    // that tracing in place -- SET_CONFIGURATION, interface open, and
+    // volume/frequency negotiation all completed) but fails without it,
+    // and that a single settle delay right after tusb_init() alone was
+    // NOT sufficient to fix it on its own (ruling out "just needs a
+    // one-time moment to settle after init" as the whole story). Since
+    // I2S output's DMA IRQ fires continuously (~1ms cadence) for as
+    // long as the device runs -- not just during a brief boot window --
+    // a one-time delay could only ever mask a NARROW timing window,
+    // whereas enumeration can legitimately take much longer than that
+    // and is competing with this DMA IRQ load the entire time. At equal
+    // default priority, ARM NVIC has no reason to favor the rarer,
+    // latency-sensitive USB event over the frequent I2S DMA one; explicit
+    // priority gives USB unambiguous precedence whenever both are
+    // pending. Set before usb_sound_card_init() so it's in effect before
+    // dcd_init() (inside tusb_init()) enables USBCTRL_IRQ.
+    irq_set_priority(USBCTRL_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
+    irq_set_priority(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, PICO_DEFAULT_IRQ_PRIORITY + 0x40);
+
     // USB init BEFORE any I2S DMA/PIO activity starts -- reordered from an
     // earlier revision of this file, which called usb_sound_card_init()
     // AFTER i2s_output_init()/i2s_input_init() and failed to enumerate at
@@ -111,11 +136,11 @@ static void core0_init(void)
     // must come before PDM for an unrelated DMA-channel-claiming reason,
     // but the ordering also has this effect: USB gets to complete its
     // enumeration handshake before any other peripheral's DMA/PIO
-    // interrupt traffic starts competing for CPU time. macOS in
-    // particular appears to be strict enough about enumeration timing
-    // that steady I2S DMA IRQ load already running during the initial
-    // SETUP/DATA/STATUS exchange was enough to prevent it from ever
-    // completing.
+    // interrupt traffic starts competing for CPU time. This reorder
+    // alone was not sufficient either (the priority fix above is what
+    // addresses the ongoing, not just initial, contention), but there's
+    // no reason to undo it -- it's still a reasonable ordering on its
+    // own merits.
     usb_sound_card_init();
 
     // I2S output before I2S input: the input's receiver PIO program
