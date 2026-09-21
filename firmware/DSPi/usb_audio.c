@@ -89,33 +89,51 @@ bool usb_audio_stream_active(void)
 
 uint32_t usb_audio_drain_ring(float *out_l, float *out_r, uint32_t max_frames)
 {
+    // Bytes-per-frame for this build's fixed 16-bit stereo format.
+    static const uint32_t bytes_per_frame = 2u * sizeof(int16_t);
+
+    // How many frames of the CURRENT head slot (the next one
+    // usb_audio_ring_peek() will return) have already been copied out in
+    // a previous call. A USB packet's frame count (~49 at 48kHz/1ms) does
+    // not evenly divide AUDIO_BUFFER_SAMPLES (192), so a slot regularly
+    // needs to be split across two calls -- without tracking this offset,
+    // the next call would restart reading that same slot from its
+    // beginning, re-decoding already-played frames as if they were new
+    // while permanently losing the un-copied tail: audible as a sharp,
+    // repeating glitch on nearly every block, not an occasional edge
+    // case. This offset persists across calls specifically so a
+    // partially-drained slot resumes correctly instead of restarting.
+    static uint32_t partial_slot_frame_offset = 0;
+
     uint32_t frames_written = 0;
 
     while (frames_written < max_frames) {
         usb_audio_slot_t *slot = usb_audio_ring_peek(&audio_ring);
         if (!slot) break;
 
-        // 16-bit stereo PCM, little-endian, interleaved L,R,L,R,...
-        uint32_t bytes_per_frame = 2u * sizeof(int16_t);
         uint32_t frames_in_slot = slot->data_len / bytes_per_frame;
-        uint32_t to_copy = frames_in_slot;
+        uint32_t frames_remaining_in_slot = frames_in_slot - partial_slot_frame_offset;
+        uint32_t to_copy = frames_remaining_in_slot;
         if (frames_written + to_copy > max_frames) to_copy = max_frames - frames_written;
 
         const int16_t *pcm = (const int16_t *)slot->data;
+        uint32_t base = partial_slot_frame_offset;
         for (uint32_t i = 0; i < to_copy; i++) {
-            out_l[frames_written + i] = (float)pcm[2 * i]     * (1.0f / 32768.0f);
-            out_r[frames_written + i] = (float)pcm[2 * i + 1] * (1.0f / 32768.0f);
+            out_l[frames_written + i] = (float)pcm[2 * (base + i)]     * (1.0f / 32768.0f);
+            out_r[frames_written + i] = (float)pcm[2 * (base + i) + 1] * (1.0f / 32768.0f);
         }
         frames_written += to_copy;
 
-        // Only fully-consumed slots are popped; a slot larger than the
-        // remaining space in this call is left for the next call to
-        // finish draining (rare: only happens if max_frames doesn't
-        // divide evenly into whole packets, which AUDIO_BUFFER_SAMPLES
-        // vs. AUDIO_EP_MAX_PKT's framing shouldn't normally produce).
-        if (to_copy == frames_in_slot) {
+        if (to_copy == frames_remaining_in_slot) {
+            // Fully drained this slot (including any carried-over offset)
+            // -- consume it and reset the offset for the next slot.
             usb_audio_ring_consume(&audio_ring);
+            partial_slot_frame_offset = 0;
         } else {
+            // Caller's buffer is full; remember exactly how far into this
+            // slot we got so the next call resumes here instead of
+            // re-reading from the start.
+            partial_slot_frame_offset += to_copy;
             break;
         }
     }
