@@ -101,13 +101,30 @@ static void core0_init(void)
     // every PSRAM-backed FX effect's QMI traffic).
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
 
+    // USB init BEFORE any I2S DMA/PIO activity starts -- reordered from an
+    // earlier revision of this file, which called usb_sound_card_init()
+    // AFTER i2s_output_init()/i2s_input_init() and failed to enumerate at
+    // all on macOS (LED confirmed boot completed fine; the device was
+    // simply invisible on the USB bus). The original DSPi calls
+    // usb_sound_card_init() as its very first peripheral init, well
+    // before i2s_input_init() -- with a comment there noting USB/S/PDIF
+    // must come before PDM for an unrelated DMA-channel-claiming reason,
+    // but the ordering also has this effect: USB gets to complete its
+    // enumeration handshake before any other peripheral's DMA/PIO
+    // interrupt traffic starts competing for CPU time. macOS in
+    // particular appears to be strict enough about enumeration timing
+    // that steady I2S DMA IRQ load already running during the initial
+    // SETUP/DATA/STATUS exchange was enough to prevent it from ever
+    // completing.
+    usb_sound_card_init();
+
     // I2S output before I2S input: the input's receiver PIO program
     // watches BCK/LRCLK pads that only carry a real clock once the
-    // output side is driving them (see i2s_input.h's top comment).
+    // output side is driving them (see i2s_input.h's top comment). This
+    // relationship is independent of the USB-ordering fix above and
+    // still holds.
     i2s_output_init();
     i2s_input_init();
-
-    usb_sound_card_init();
 
     // FX chain. fx_control_init() (the dedicated FX UART) must run
     // before any fx_*_init() that could touch PSRAM, matching this
