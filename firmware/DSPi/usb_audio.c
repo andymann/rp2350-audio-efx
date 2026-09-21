@@ -477,5 +477,6 @@ void usb_sound_card_init(void) {
     // async feedback encoding.
     nominal_feedback_10_14 = (uint32_t)(((uint64_t)SAMPLE_RATE_HZ << 14) / 1000u);
 
-    tusb_init();
+    bool init_ok = tusb_init();
+    printf("tusb_init() returned %d\n", (int)init_ok);
 }
