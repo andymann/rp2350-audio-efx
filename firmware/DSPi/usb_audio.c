@@ -467,24 +467,4 @@ void usb_sound_card_init(void) {
     nominal_feedback_10_14 = (uint32_t)(((uint64_t)SAMPLE_RATE_HZ << 14) / 1000u);
 
     tusb_init();
-
-    // Brief settle delay after USB stack init, before anything else in
-    // boot touches the bus or starts other DMA/PIO activity. Added after
-    // a reported enumeration failure on macOS (device booted fine --
-    // LED confirmed -- but never appeared as any USB device) turned out
-    // to be a timing-sensitive issue: a diagnostic build with printf()
-    // tracing sprinkled through the whole SETUP-handling path (each
-    // print costing a few ms over a 115200-baud debug UART) enumerated
-    // successfully every time, all the way through SET_CONFIGURATION,
-    // interface open, and volume/frequency control negotiation. Removing
-    // the tracing reproduced the original failure, confirming a real
-    // race rather than a descriptor or driver-logic bug (which had
-    // already been verified byte-correct and logically correct via that
-    // same tracing). This is the minimal, targeted version of "give it
-    // time to settle" rather than leaving debug-print latency in the
-    // shipped firmware -- if 2ms here isn't sufficient on its own, the
-    // race is more likely to be about spacing between individual SETUP
-    // responses than a one-time post-init settle window, which would
-    // need a different fix.
-    sleep_ms(2);
 }
