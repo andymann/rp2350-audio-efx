@@ -197,11 +197,22 @@ int main(void)
 
     // Core 1 owns the entire audio processing loop (see core1_main() and
     // this file's top comment for why). Core 0 is now free to do
-    // nothing but service USB as fast as possible.
+    // nothing but service USB and the FX UART control protocol.
     multicore_launch_core1(core1_main);
 
     while (true) {
         tud_task();
+        // fx_control.c's UART command parser (Set FX/Query FX/etc. over
+        // the dedicated FX UART, UART0 GPIO 16/17) is polling-based, not
+        // interrupt-driven -- fx_control_poll() must be called
+        // regularly for it to process incoming bytes at all. Missing
+        // from an earlier revision of this file (the FX UART simply
+        // never responded to anything, having no poll call anywhere).
+        // Cheap (a few conditional checks and, when a full frame is
+        // ready, byte-level parsing of a 9600 baud stream), so calling
+        // it every core-0 loop iteration alongside tud_task() costs
+        // nothing meaningful against USB servicing.
+        fx_control_poll();
     }
 
     return 0;
