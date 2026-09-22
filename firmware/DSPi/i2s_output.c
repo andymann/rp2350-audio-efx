@@ -23,7 +23,15 @@
 
 // This device is the sole owner of PIO0 SM0 / DMA channel 0 -- no S/PDIF,
 // ADAT or PDM output exists to share (or contend for) hardware with.
-#define I2S_OUT_PIO       pio0
+// I2S_OUT_PIO is the BLOCK INDEX (0/1/2), matching audio_i2s_config_t's
+// uint8_t pio field -- NOT the PIO pointer type (pio0/pio1/pio2) used
+// elsewhere in the SDK for direct pio_*() calls. An earlier revision of
+// this file passed the pointer here directly; it happened to produce
+// the numerically-correct value after truncation (PIO0_BASE's low byte
+// is 0x00) but triggered an int-conversion warning and was fixed to
+// remove any doubt about correctness rather than rely on that
+// coincidence.
+#define I2S_OUT_PIO       0u
 #define I2S_OUT_SM        0u
 #define I2S_OUT_DMA_CH    0u
 

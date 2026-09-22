@@ -106,6 +106,7 @@ target_link_libraries(DSPi
     hardware_flash
     pico_audio_i2s_multi
     tinyusb_device
+    pico_multicore
 )
 
 # Debug UART removed; GPIO 16/17 are freed for the FX UART control

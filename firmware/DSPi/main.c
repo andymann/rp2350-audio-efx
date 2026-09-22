@@ -7,19 +7,44 @@
  * USB control protocol, and several DSP-island features this build
  * doesn't have) down to just what that path needs.
  *
- * Architecture: a PULL loop, not the original's push/event-driven one.
- * The original's various outputs (S/PDIF/ADAT/I2S, runtime-switchable)
- * could each be a clock slave to whichever input was active, so
- * process_input_block() was driven by "whichever input source delivers
- * samples". This build's I2S output is always the system's own clock
- * master (see i2s_output.h), so the natural driver is the output's own
- * need for the next buffer: take a producer buffer, fill it via
- * audio_pipeline_fill_block(), give it back, repeat.
+ * Architecture: two cores, split specifically to work around a hardcoded
+ * blocking call inside pico_audio_i2s_multi. Core 1 runs the audio
+ * processing loop (take a producer buffer, fill it via
+ * audio_pipeline_fill_block(), give it back, repeat) -- the natural
+ * driver here is the I2S output's own need for the next buffer, since
+ * this build's I2S output is always the system's own clock master (see
+ * i2s_output.h). Core 0 does nothing but call tud_task() in a tight
+ * loop.
+ *
+ * This split exists because give_audio_buffer() -> i2s_wrap_producer_give()
+ * (inside pico_audio_i2s_multi's audio_i2s_multi.c) calls
+ * get_free_audio_buffer(consumer_pool, true) with a HARDCODED true --
+ * unconditionally blocking until the I2S output DMA frees a consumer
+ * buffer, regardless of how take_audio_buffer() was called. An earlier
+ * single-core revision of this file called both tud_task() and
+ * give_audio_buffer() from the same loop; every call to give_audio_buffer()
+ * blocked for close to a full audio block period (~4.3ms at 44.1kHz/192
+ * samples), so tud_task() -- and therefore all USB packet servicing --
+ * was only reached ~230 times/sec instead of the ~1000/sec USB full-
+ * speed isochronous transfers need. Confirmed directly: instrumented
+ * builds showed the main loop itself, xfer_cb, and the fraction of
+ * genuinely non-silent audio frames all converging on the same ~22-23%
+ * figure (roughly 1 packet serviced per audio block instead of the ~4
+ * that actually arrive), which was audible as severe, "bitcrusher"-like
+ * distortion -- not a bug in any DSP/decode logic (extensively verified
+ * correct beforehand), but USB simply being starved of CPU time by this
+ * blocking call. usb_audio_ring.h's SPSC ring (already using __dmb() for
+ * RP2350/Cortex-M33 write-buffer safety, not just same-core ISR-vs-
+ * mainloop ordering) is what makes this cross-core split safe: the
+ * producer side (usb_audio_ring_push(), called from the USB ISR) still
+ * runs on core 0, the consumer side (usb_audio_drain_ring(), called from
+ * audio_pipeline_fill_block()) now runs on core 1.
  */
 
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
 #include "pico/audio.h"
+#include "pico/multicore.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
 #include "hardware/structs/bus_ctrl.h"
@@ -59,13 +84,17 @@ static void core0_init(void)
         __asm__ volatile("vmsr fpscr, %0" : : "r"(fpscr));
     }
 
-    // 307.2MHz (VCO 1536 / 5 / 1) -- integer I2S dividers at 48kHz.
-    // Carried over unchanged from the original: every FX effect's PSRAM
-    // clock-divisor comments (fx_delay.h, fx_reverb.h, fx_beatrepeat.h)
-    // and the 40MHz PICO_DEFAULT_PSRAM_MAX_FREQ setting in this file's
-    // sibling CMakeLists.txt assume this exact system clock -- changing
-    // it would silently retune every PSRAM QMI divisor to a different
+    // 307.2MHz (VCO 1536 / 5 / 1). Carried over unchanged from the
+    // original: every FX effect's PSRAM clock-divisor comments
+    // (fx_delay.h, fx_reverb.h, fx_beatrepeat.h) and the 40MHz
+    // PICO_DEFAULT_PSRAM_MAX_FREQ setting in this file's sibling
+    // CMakeLists.txt assume this exact system clock -- changing it
+    // would silently retune every PSRAM QMI divisor to a different
     // real-world frequency than the one actually validated on hardware.
+    // (This clock gives an exact-integer PIO clock divider for 48kHz-
+    // family rates specifically, but config.h currently runs at 44100Hz
+    // -- see its comment for why that's an approximate, not exact,
+    // divider here, and why that turned out not to matter in practice.)
     vreg_set_voltage(VREG_VOLTAGE_1_15);
     busy_wait_ms(10);
     if (!set_sys_clock_hz(307200000, false)) {
@@ -132,20 +161,18 @@ static void core0_init(void)
              fx_delay_psram_ok() && fx_reverb_psram_ok() && fx_beatrepeat_psram_ok());
 }
 
-int main(void)
+// Core 1: the audio processing loop. Blocking give_audio_buffer() is
+// fine here -- see the top-of-file comment for why this can no longer
+// share a core with USB servicing.
+static void core1_main(void)
 {
-    core0_init();
-
     audio_buffer_pool_t *out_pool = i2s_output_pool();
 
     while (true) {
-        tud_task();
-
-        // Blocking take: normally returns quickly, since the output DMA
-        // is steadily consuming and returning buffers to the free list
-        // at a fixed ~4ms cadence (AUDIO_BUFFER_SAMPLES @ SAMPLE_RATE_HZ).
-        // tud_task() above still runs at least once per loop iteration
-        // regardless of how long this blocks.
+        // Blocking take is fine here too (this core has nothing else to
+        // do): normally returns quickly, since the output DMA is
+        // steadily consuming and returning buffers to the free list at
+        // a fixed ~4ms cadence (AUDIO_BUFFER_SAMPLES @ SAMPLE_RATE_HZ).
         audio_buffer_t *buf = take_audio_buffer(out_pool, true);
         if (!buf) continue;
 
@@ -155,7 +182,26 @@ int main(void)
         audio_pipeline_fill_block((int32_t *)buf->buffer->bytes, frames, SAMPLE_RATE_HZ);
         buf->sample_count = frames;
 
+        // Blocks here (i2s_wrap_producer_give(), inside
+        // pico_audio_i2s_multi, waits for a free consumer buffer) --
+        // this is the actual, hardcoded-blocking call this whole
+        // two-core split exists to isolate away from USB servicing. See
+        // this file's top comment.
         give_audio_buffer(out_pool, buf);
+    }
+}
+
+int main(void)
+{
+    core0_init();
+
+    // Core 1 owns the entire audio processing loop (see core1_main() and
+    // this file's top comment for why). Core 0 is now free to do
+    // nothing but service USB as fast as possible.
+    multicore_launch_core1(core1_main);
+
+    while (true) {
+        tud_task();
     }
 
     return 0;

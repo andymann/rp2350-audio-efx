@@ -24,10 +24,20 @@
 // Fixed operating rate. The original device could switch between
 // 44100/48000/96000 at the host's request; this build runs a single
 // fixed rate to keep the I2S input/output PIO+DMA setup simple (no
-// runtime PIO reload / divider recompute). 48kHz matches every FX
-// effect's own internal assumptions (tempo_sync.c, the PSRAM buffer
-// sizing in fx_delay.h/fx_beatrepeat.h/fx_reverb.h).
-#define SAMPLE_RATE_HZ 48000u
+// runtime PIO reload / divider recompute).
+//
+// Set to 44100 (was originally 48000) while chasing a severe,
+// "bitcrusher"-like distortion report -- that change turned out NOT to
+// be the actual fix (the real cause was a main-loop architecture issue;
+// see main.c's top comment), but 44100 is the configuration that was
+// verified working afterward, so it's been left as-is rather than
+// switched back and re-verified separately. 307.2MHz (this board's
+// fixed system clock -- see main.c) gives an exact-integer PIO clock
+// divider for 48kHz-family rates but only an approximate (fractional-
+// divider) one at 44100; this introduces a small amount of clock jitter
+// that wouldn't exist at 48000, evidently inaudible in practice. 48000
+// would need its own round of verification before switching back.
+#define SAMPLE_RATE_HZ 44100u
 
 // Samples processed per pipeline call. Matches the original's
 // AUDIO_BUFFER_SAMPLES exactly (4ms blocks @ 48kHz) -- every FX effect's
