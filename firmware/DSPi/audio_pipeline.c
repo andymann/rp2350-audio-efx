@@ -15,6 +15,7 @@
 #include "config.h"
 #include "usb_audio.h"
 #include "i2s_input.h"
+#include "fx_control.h"
 #include "fx_delay.h"
 #include "fx_reverb.h"
 #include "fx_stutter.h"
@@ -35,6 +36,17 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
                                 uint32_t sample_rate_hz)
 {
     if (sample_count > AUDIO_BUFFER_SAMPLES) sample_count = AUDIO_BUFFER_SAMPLES;
+
+    // Restart Clock command (0x07, fx_control.h): resets rhythmic
+    // effects' phase back to their start-of-cycle position. Checked
+    // once per block, here rather than in fx_control.c, because this is
+    // core 1 (where fx_stutter/fx_phaser's state is actually touched);
+    // fx_control_poll() -- which sets this flag -- runs on core 0.
+    if (fx_control_clock_restart_requested()) {
+        fx_stutter_reset_phase();
+        fx_phaser_reset_phase();
+        fx_control_clock_restart_ack();
+    }
 
     memset(usb_l, 0, sample_count * sizeof(float));
     memset(usb_r, 0, sample_count * sizeof(float));

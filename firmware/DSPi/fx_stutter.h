@@ -65,6 +65,14 @@
 // Reset phase state. Call once at boot before the pipeline starts.
 void fx_stutter_init(void);
 
+// Reset the gate cycle back to its start (open half, position 0) without
+// otherwise touching this effect's parameters. For the Restart Clock
+// command (0x07, fx_control.h) -- called from audio_pipeline.c on core 1
+// once per block when fx_control_clock_restart_requested() is set, never
+// directly from fx_control.c (which runs on core 0; this effect's state
+// is only ever touched from core 1's audio processing loop).
+void fx_stutter_reset_phase(void);
+
 // Process sample_count samples of the main stereo pair in place. Reads
 // this effect's state via fx_control_get(FX_STUTTER_EFFECT_NUM, ...);
 // no-op (passthrough) if that slot is disabled. Safe to call every packet

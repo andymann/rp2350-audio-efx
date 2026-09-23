@@ -83,6 +83,15 @@
 // starts.
 void fx_phaser_init(void);
 
+// Reset the LFO phase back to 0 (sweep starts at the center frequency,
+// moving upward) WITHOUT touching the allpass filter state or this
+// effect's parameters. For the Restart Clock command (0x07,
+// fx_control.h) -- called from audio_pipeline.c on core 1 once per
+// block when fx_control_clock_restart_requested() is set, never
+// directly from fx_control.c (which runs on core 0; this effect's state
+// is only ever touched from core 1's audio processing loop).
+void fx_phaser_reset_phase(void);
+
 // Process sample_count samples of the main stereo pair in place. Reads
 // this effect's state via fx_control_get(FX_PHASER_EFFECT_NUM, ...);
 // no-op (passthrough) if that slot is disabled. Safe to call every packet
