@@ -25,10 +25,25 @@
 #include <stdint.h>
 #include "hardware/sync.h"   // __dmb()
 
-// Ring geometry.  4 slots = 4ms of jitter absorption at 1 packet/ms.
-// The ring should be nearly empty in steady state; its purpose is
-// decoupling, not deep buffering.
-#define USB_RING_SLOTS      4
+// Ring geometry. Sized for THIS build's specific consumption pattern:
+// audio_pipeline_fill_block() (the consumer) runs on core 1, gated by a
+// hardcoded-blocking call inside pico_audio_i2s_multi (see main.c's top
+// comment) to roughly once per audio block (~4.3ms at 44.1kHz/192
+// samples) -- not once per USB packet (~1ms) like a tighter-polling
+// consumer would. A head/tail ring using "next_head == tail" as its
+// full check (this one) can only ever hold SLOTS-1 items before
+// appearing full, not SLOTS -- the original 4-slot sizing (from the
+// upstream DSPi project this file was carried over from unchanged)
+// therefore only actually absorbed ~3ms of jitter, not the 4ms its own
+// comment claimed. That was fine for the original's tighter-cadence
+// consumer, but for this build's ~4.3ms cadence it was measurably
+// insufficient: with ~4.3 packets arriving between drains but only 3
+// usable slots to hold them, roughly 68% of frames came through non-
+// silent instead of the expected ~100% -- confirmed directly by
+// counting real-vs-silent frames. 8 slots (7 usable) gives comfortable
+// headroom above the ~4.3 actually needed, at a cost of ~3.1KB more
+// SRAM (negligible against this build's large free margin).
+#define USB_RING_SLOTS      8
 #define USB_RING_SLOT_MASK  (USB_RING_SLOTS - 1)
 
 // Maximum payload per slot.  Must accommodate the largest possible USB audio

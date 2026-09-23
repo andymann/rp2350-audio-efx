@@ -17,6 +17,11 @@ void fx_stutter_init(void)
     cycle_pos = 0;
 }
 
+void fx_stutter_reset_phase(void)
+{
+    cycle_pos = 0;
+}
+
 // RAM-resident for the same reason as fx_delay_process_block (see its
 // comment): this runs in the same per-sample hot path, chained right
 // after it on the same buf_out[0]/[1] channels.

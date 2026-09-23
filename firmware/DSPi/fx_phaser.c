@@ -59,6 +59,11 @@ void fx_phaser_init(void)
     lfo_phase = 0.0f;
 }
 
+void fx_phaser_reset_phase(void)
+{
+    lfo_phase = 0.0f;
+}
+
 static inline float allpass_process(ApState *st, float in, float a)
 {
     float out = a * in + st->x1 - a * st->y1;

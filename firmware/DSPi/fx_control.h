@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the five commands below -- it is meant to be dead
+ * and only understands the seven commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -103,6 +103,30 @@
  *     stored tempo, same encoding as Set BPM. Defaults to 12000 (120.00 BPM)
  *     at boot until a Set BPM command changes it.
  *
+ *   Disable All    (0x06, 1 byte total):
+ *     0x06
+ *     Sets every effect slot's enabled bit to 0 (silent bypass), leaving
+ *     every slot's stored param1/param2/param3/dry_wet untouched -- a
+ *     panic-style "kill all effects instantly" separate from having to
+ *     send seven individual Set FX commands. This command always
+ *     succeeds and echoes the single byte back on success.
+ *
+ *   Restart Clock  (0x07, 1 byte total):
+ *     0x07
+ *     Resets every rhythmic effect's phase back to its start-of-cycle
+ *     position -- fx_stutter's open/mute gate cycle and fx_phaser's LFO
+ *     sweep -- so sending this exactly on a beat re-syncs them to
+ *     external music. Does not touch BPM or any effect's stored
+ *     parameters, and has no effect on fx_delay, fx_djfilter, fx_reverb,
+ *     or fx_beatrepeat: none of those have a simple, continuously-
+ *     running cycle that can drift out of sync with external audio in
+ *     the same way (fx_delay/fx_reverb are continuous feedback/decay
+ *     processes with no repeating cycle to restart; fx_djfilter isn't
+ *     tempo-synced at all; fx_beatrepeat's loop is already anchored to
+ *     whenever it was last enabled, not a free-running background
+ *     clock). This command always succeeds -- there is no invalid form
+ *     of a 1-byte command -- and echoes the single byte back on success.
+ *
  * On boot, before any command is processed, the device sends the literal
  * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a
  * liveness/presence banner. It is not part of the command/response protocol
@@ -161,5 +185,20 @@ bool fx_control_get(uint8_t effect_num, FxState *out);
 // DSP pipeline once tempo-synced effects exist, and by fx_control.c itself
 // when building a Query BPM response.
 uint16_t fx_control_get_bpm(void);
+
+// True exactly once after the Restart Clock command (0x07) is received,
+// until acknowledged. audio_pipeline_fill_block() (core 1) polls this
+// once per block; if set, it resets every rhythmic effect's phase
+// (fx_stutter's gate cycle, fx_phaser's LFO) back to its start-of-cycle
+// position, then calls fx_control_clock_restart_ack() to clear it.
+// Simple flag, no explicit lock -- same cross-core pattern already used
+// for fx_state[]/bpm_x100 (written by fx_control_poll() on core 0, read
+// on core 1): a momentary staleness (the flag being noticed one block
+// late) is harmless for a user-triggered, one-off resync command.
+// Effects with no simple, continuously-running phase to restart
+// (fx_delay, fx_djfilter, fx_reverb, fx_beatrepeat) are unaffected --
+// see fx_control.c's Restart Clock command comment for why.
+bool fx_control_clock_restart_requested(void);
+void fx_control_clock_restart_ack(void);
 
 #endif // FX_CONTROL_H

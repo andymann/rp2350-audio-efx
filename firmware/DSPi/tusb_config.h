@@ -19,10 +19,17 @@ extern "C" {
 #error "CFG_TUSB_MCU must be defined by the build system"
 #endif
 
+// Newer TinyUSB (pulled in with the SDK 2.3.0 bump for hardware_psram)
+// requires this explicitly -- device mode on RHPORT0, the RP2040/RP2350's
+// only USB PHY. CFG_TUD_ENABLED below is derived from this automatically
+// by tusb_option.h; the original tusb_config.h (written against an
+// older TinyUSB snapshot that didn't require this) set CFG_TUD_ENABLED
+// directly instead.
+#define CFG_TUSB_RHPORT0_MODE   OPT_MODE_DEVICE
+
 #define CFG_TUSB_OS             OPT_OS_PICO
 #define CFG_TUSB_DEBUG          0
 
-#define CFG_TUD_ENABLED         1
 #define CFG_TUH_ENABLED         0
 
 #define CFG_TUD_ENDPOINT0_SIZE  64
