@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the six commands below -- it is meant to be dead
+ * and only understands the seven commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -102,6 +102,14 @@
  *     Response is 3 bytes: 0x05, bpm_hi (MSB), bpm_lo (LSB) -- the current
  *     stored tempo, same encoding as Set BPM. Defaults to 12000 (120.00 BPM)
  *     at boot until a Set BPM command changes it.
+ *
+ *   Disable All    (0x06, 1 byte total):
+ *     0x06
+ *     Sets every effect slot's enabled bit to 0 (silent bypass), leaving
+ *     every slot's stored param1/param2/param3/dry_wet untouched -- a
+ *     panic-style "kill all effects instantly" separate from having to
+ *     send seven individual Set FX commands. This command always
+ *     succeeds and echoes the single byte back on success.
  *
  *   Restart Clock  (0x07, 1 byte total):
  *     0x07

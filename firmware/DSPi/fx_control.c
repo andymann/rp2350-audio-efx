@@ -48,6 +48,7 @@
 #define CMD_QUERY_FW      0x03u
 #define CMD_SET_BPM       0x04u
 #define CMD_QUERY_BPM     0x05u
+#define CMD_DISABLE_ALL   0x06u
 #define CMD_RESTART_CLOCK 0x07u
 
 #define SET_FX_LEN          7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
@@ -57,6 +58,7 @@
 #define SET_BPM_LEN         3u   // cmd + bpm_hi + bpm_lo
 #define QUERY_BPM_LEN       1u   // cmd only
 #define QUERY_BPM_RESP_LEN  3u   // cmd + bpm_hi + bpm_lo
+#define DISABLE_ALL_LEN     1u   // cmd only
 #define RESTART_CLOCK_LEN   1u   // cmd only
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
@@ -158,6 +160,7 @@ static uint8_t expected_len_for_cmd(uint8_t cmd) {
         case CMD_QUERY_FW:      return QUERY_FW_LEN;
         case CMD_SET_BPM:       return SET_BPM_LEN;
         case CMD_QUERY_BPM:     return QUERY_BPM_LEN;
+        case CMD_DISABLE_ALL:   return DISABLE_ALL_LEN;
         case CMD_RESTART_CLOCK: return RESTART_CLOCK_LEN;
         default:                return 0;
     }
@@ -235,6 +238,20 @@ static void handle_query_bpm(void) {
     start_tx(resp, QUERY_BPM_RESP_LEN);
 }
 
+// Always succeeds. Clears only the enabled bit on every slot -- stored
+// param1/param2/param3/dry_wet are left exactly as they were, so
+// whatever was dialed in comes right back if each slot is individually
+// re-enabled afterward. fx_state[] is already the established cross-
+// core-shared state (written here on core 0, read via fx_control_get()
+// on core 1's audio processing loop) -- no new synchronization needed,
+// unlike the Restart Clock command's phase state.
+static void handle_disable_all(const uint8_t *f) {
+    for (uint8_t i = 0; i < FX_CONTROL_NUM_EFFECTS; i++) {
+        fx_state[i].enabled = 0;
+    }
+    start_tx(f, DISABLE_ALL_LEN);   // echo the command verbatim
+}
+
 // Always succeeds (no invalid form of a 1-byte command) -- just raises
 // the flag audio_pipeline_fill_block() polls on core 1 and echoes back.
 // The actual per-effect phase resets happen there, not here: this
@@ -248,11 +265,12 @@ static void handle_restart_clock(const uint8_t *f) {
 
 static void dispatch_frame(void) {
     switch (frame_buf[0]) {
-        case CMD_SET_FX:        handle_set_fx(frame_buf);      break;
-        case CMD_QUERY_FX:      handle_query_fx(frame_buf);    break;
-        case CMD_QUERY_FW:      handle_query_fw();             break;
-        case CMD_SET_BPM:       handle_set_bpm(frame_buf);     break;
-        case CMD_QUERY_BPM:     handle_query_bpm();            break;
+        case CMD_SET_FX:        handle_set_fx(frame_buf);        break;
+        case CMD_QUERY_FX:      handle_query_fx(frame_buf);      break;
+        case CMD_QUERY_FW:      handle_query_fw();               break;
+        case CMD_SET_BPM:       handle_set_bpm(frame_buf);       break;
+        case CMD_QUERY_BPM:     handle_query_bpm();              break;
+        case CMD_DISABLE_ALL:   handle_disable_all(frame_buf);   break;
         case CMD_RESTART_CLOCK: handle_restart_clock(frame_buf); break;
         default: break;   // unreachable: expected_len_for_cmd() already filtered
     }
