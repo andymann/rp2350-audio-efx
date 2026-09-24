@@ -2,19 +2,14 @@
  * i2s_input.h - Fixed single-pair I2S input for DSPi (minimal build)
  *
  * Trimmed from the original: one stereo pair only (no 4/6/8-channel
- * fan-out), always runs the plain wait-driven "slave" PIO program
- * (audio_i2s_rx_slave, watching this device's OWN I2S output clock --
- * see i2s_output.h's top comment) rather than the clkmaster or
- * external-clock "checked" variants, which existed for input
- * configurations this build doesn't have (I2S input with no I2S output
- * elsewhere in the system; an externally-clocked I2S source needing
- * framing-slip detection). No dynamic start/stop/resync, no rate
- * detection/servo -- the rate is always SAMPLE_RATE_HZ (config.h),
- * because it's derived from the SAME clock i2s_output.c generates.
- *
- * i2s_output_init() MUST run before i2s_input_init() -- this receiver
- * watches BCK/LRCLK pads that only carry a real clock once the output
- * side is driving them.
+ * fan-out). Runs the self-verifying "checked" wait-driven PIO program
+ * (audio_i2s_rx_slave_checked), watching BCK/LRCLK genuinely driven by
+ * the external PCM1808 breakout board -- see i2s_output.h's top comment
+ * for why this device does not generate its own I2S clocks. No dynamic
+ * start/stop/resync beyond what the checked program's own per-frame
+ * LRCLK re-verification provides, no rate detection/servo -- the rate
+ * is always SAMPLE_RATE_HZ (config.h), which must match whatever rate
+ * the PCM1808's own fixed-frequency onboard crystal actually produces.
  */
 
 #ifndef I2S_INPUT_H

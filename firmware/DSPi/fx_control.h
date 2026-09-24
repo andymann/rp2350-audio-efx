@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the seven commands below -- it is meant to be dead
+ * and only understands the eight commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -127,6 +127,17 @@
  *     clock). This command always succeeds -- there is no invalid form
  *     of a 1-byte command -- and echoes the single byte back on success.
  *
+ *   Set Input Source (0x08, 2 bytes total):
+ *     0x08, source[0-1]
+ *     0x00 selects USB as the sole active input source, 0x01 selects
+ *     I2S (the PCM1808 ADC) -- exactly one is ever active at a time,
+ *     matching the original DSPi's own single-active-input-source
+ *     model, not a simultaneous mix of both. The other source is not
+ *     merely attenuated: it contributes nothing to the output at all
+ *     while not selected. Defaults to USB (0x00) at boot. A frame with
+ *     source > 1 is dropped: no echo, no state change. On success, the
+ *     device echoes the exact 2-byte command back.
+ *
  * On boot, before any command is processed, the device sends the literal
  * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a
  * liveness/presence banner. It is not part of the command/response protocol
@@ -158,6 +169,15 @@ typedef struct {
     uint8_t param3;
     uint8_t dry_wet;   // 0-255
 } FxState;
+
+// Exactly one active at a time -- matches the original DSPi's own
+// single-active-input-source model. See the Set Input Source (0x08)
+// command doc above and audio_pipeline.c's use of
+// fx_control_get_input_source().
+typedef enum {
+    FX_INPUT_SOURCE_USB = 0,
+    FX_INPUT_SOURCE_I2S = 1,
+} FxInputSource;
 
 // Bring up the dedicated FX-control UART (fixed pins/baud; see fx_control.c).
 // Call once at boot, after the audio pins above it in main.c's init order
@@ -200,5 +220,15 @@ uint16_t fx_control_get_bpm(void);
 // see fx_control.c's Restart Clock command comment for why.
 bool fx_control_clock_restart_requested(void);
 void fx_control_clock_restart_ack(void);
+
+// Current input source selection, as last set by a Set Input Source
+// (0x08) command. Defaults to FX_INPUT_SOURCE_USB at boot. Read by
+// audio_pipeline_fill_block() (core 1) once per block to decide which
+// source's samples reach the mix -- same simple-read, no-explicit-lock
+// cross-core pattern as fx_control_get_bpm() (written by
+// fx_control_poll() on core 0, read on core 1): a momentary staleness
+// of at most one audio block is harmless for a user-triggered source
+// switch.
+FxInputSource fx_control_get_input_source(void);
 
 #endif // FX_CONTROL_H

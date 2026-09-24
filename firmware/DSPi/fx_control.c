@@ -43,13 +43,14 @@
 #define FRAME_TIMEOUT_US 50000u               // inter-byte mid-frame timeout
 
 // Commands
-#define CMD_SET_FX        0x01u
-#define CMD_QUERY_FX      0x02u
-#define CMD_QUERY_FW      0x03u
-#define CMD_SET_BPM       0x04u
-#define CMD_QUERY_BPM     0x05u
-#define CMD_DISABLE_ALL   0x06u
-#define CMD_RESTART_CLOCK 0x07u
+#define CMD_SET_FX          0x01u
+#define CMD_QUERY_FX        0x02u
+#define CMD_QUERY_FW        0x03u
+#define CMD_SET_BPM         0x04u
+#define CMD_QUERY_BPM       0x05u
+#define CMD_DISABLE_ALL     0x06u
+#define CMD_RESTART_CLOCK   0x07u
+#define CMD_SET_INPUT_SRC   0x08u
 
 #define SET_FX_LEN          7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
 #define QUERY_FX_LEN        2u   // cmd + effect_num
@@ -60,6 +61,7 @@
 #define QUERY_BPM_RESP_LEN  3u   // cmd + bpm_hi + bpm_lo
 #define DISABLE_ALL_LEN     1u   // cmd only
 #define RESTART_CLOCK_LEN   1u   // cmd only
+#define SET_INPUT_SRC_LEN   2u   // cmd + source
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
 // Boot banner: sent once, unsolicited, right after the port comes up --
@@ -97,6 +99,12 @@ static uint16_t bpm_x100 = BPM_X100_DEFAULT;
 // no-explicit-lock cross-core pattern as fx_state[]/bpm_x100 above --
 // see fx_control.h's doc comment on fx_control_clock_restart_requested().
 static volatile bool clock_restart_pending = false;
+
+// Current input source selection, set by the Set Input Source command's
+// handler (core 0), read by fx_control_get_input_source() (core 1, via
+// audio_pipeline_fill_block()). Same simple-variable, no-explicit-lock
+// cross-core pattern as bpm_x100 above.
+static volatile FxInputSource input_source = FX_INPUT_SOURCE_USB;
 
 // ---------------------------------------------------------------------------
 // RX ring (single-producer ISR, single-consumer poll)
@@ -162,6 +170,7 @@ static uint8_t expected_len_for_cmd(uint8_t cmd) {
         case CMD_QUERY_BPM:     return QUERY_BPM_LEN;
         case CMD_DISABLE_ALL:   return DISABLE_ALL_LEN;
         case CMD_RESTART_CLOCK: return RESTART_CLOCK_LEN;
+        case CMD_SET_INPUT_SRC: return SET_INPUT_SRC_LEN;
         default:                return 0;
     }
 }
@@ -263,15 +272,25 @@ static void handle_restart_clock(const uint8_t *f) {
     start_tx(f, RESTART_CLOCK_LEN);   // echo the command verbatim
 }
 
+// Frame is dropped (no echo, no state change) if source > 1 -- matches
+// Set FX's own validate-then-drop pattern for out-of-range parameters.
+static void handle_set_input_source(const uint8_t *f) {
+    uint8_t source = f[1];
+    if (source > (uint8_t)FX_INPUT_SOURCE_I2S) return;   // drop, no echo
+    input_source = (FxInputSource)source;
+    start_tx(f, SET_INPUT_SRC_LEN);   // echo the command verbatim
+}
+
 static void dispatch_frame(void) {
     switch (frame_buf[0]) {
-        case CMD_SET_FX:        handle_set_fx(frame_buf);        break;
-        case CMD_QUERY_FX:      handle_query_fx(frame_buf);      break;
-        case CMD_QUERY_FW:      handle_query_fw();               break;
-        case CMD_SET_BPM:       handle_set_bpm(frame_buf);       break;
-        case CMD_QUERY_BPM:     handle_query_bpm();              break;
-        case CMD_DISABLE_ALL:   handle_disable_all(frame_buf);   break;
-        case CMD_RESTART_CLOCK: handle_restart_clock(frame_buf); break;
+        case CMD_SET_FX:        handle_set_fx(frame_buf);          break;
+        case CMD_QUERY_FX:      handle_query_fx(frame_buf);        break;
+        case CMD_QUERY_FW:      handle_query_fw();                 break;
+        case CMD_SET_BPM:       handle_set_bpm(frame_buf);         break;
+        case CMD_QUERY_BPM:     handle_query_bpm();                break;
+        case CMD_DISABLE_ALL:   handle_disable_all(frame_buf);     break;
+        case CMD_RESTART_CLOCK: handle_restart_clock(frame_buf);   break;
+        case CMD_SET_INPUT_SRC: handle_set_input_source(frame_buf); break;
         default: break;   // unreachable: expected_len_for_cmd() already filtered
     }
 }
@@ -435,4 +454,9 @@ bool fx_control_clock_restart_requested(void) {
 
 void fx_control_clock_restart_ack(void) {
     clock_restart_pending = false;
+}
+
+DSP_TIME_CRITICAL
+FxInputSource fx_control_get_input_source(void) {
+    return input_source;
 }

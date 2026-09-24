@@ -7,43 +7,49 @@
  * USB control protocol, and several DSP-island features this build
  * doesn't have) down to just what that path needs.
  *
- * Architecture: two cores, split specifically to work around a hardcoded
- * blocking call inside pico_audio_i2s_multi. Core 1 runs the audio
- * processing loop (take a producer buffer, fill it via
- * audio_pipeline_fill_block(), give it back, repeat) -- the natural
- * driver here is the I2S output's own need for the next buffer, since
- * this build's I2S output is always the system's own clock master (see
- * i2s_output.h). Core 0 does nothing but call tud_task() in a tight
- * loop.
+ * Architecture: two cores. Core 1 runs the audio processing loop
+ * (fill a block via audio_pipeline_fill_block(), write it to the I2S
+ * output's own TX ring via i2s_output_write_block(), repeat). Core 0
+ * does nothing but call tud_task() in a tight loop.
  *
- * This split exists because give_audio_buffer() -> i2s_wrap_producer_give()
- * (inside pico_audio_i2s_multi's audio_i2s_multi.c) calls
+ * This split exists because an earlier version of this file's I2S
+ * output used pico_audio_i2s_multi's high-level API, whose
+ * give_audio_buffer() -> i2s_wrap_producer_give() calls
  * get_free_audio_buffer(consumer_pool, true) with a HARDCODED true --
  * unconditionally blocking until the I2S output DMA frees a consumer
- * buffer, regardless of how take_audio_buffer() was called. An earlier
- * single-core revision of this file called both tud_task() and
- * give_audio_buffer() from the same loop; every call to give_audio_buffer()
- * blocked for close to a full audio block period (~4.3ms at 44.1kHz/192
- * samples), so tud_task() -- and therefore all USB packet servicing --
- * was only reached ~230 times/sec instead of the ~1000/sec USB full-
- * speed isochronous transfers need. Confirmed directly: instrumented
- * builds showed the main loop itself, xfer_cb, and the fraction of
- * genuinely non-silent audio frames all converging on the same ~22-23%
- * figure (roughly 1 packet serviced per audio block instead of the ~4
- * that actually arrive), which was audible as severe, "bitcrusher"-like
+ * buffer, regardless of how take_audio_buffer() was called. A single-
+ * core revision of this file that called both tud_task() and
+ * give_audio_buffer() from the same loop blocked on that call for close
+ * to a full audio block period (~4.3ms at 44.1kHz/192 samples) every
+ * time, so tud_task() -- and therefore all USB packet servicing -- was
+ * only reached ~230 times/sec instead of the ~1000/sec USB full-speed
+ * isochronous transfers need. Confirmed directly: instrumented builds
+ * showed the main loop itself, xfer_cb, and the fraction of genuinely
+ * non-silent audio frames all converging on the same ~22-23% figure
+ * (roughly 1 packet serviced per audio block instead of the ~4 that
+ * actually arrive), which was audible as severe, "bitcrusher"-like
  * distortion -- not a bug in any DSP/decode logic (extensively verified
  * correct beforehand), but USB simply being starved of CPU time by this
- * blocking call. usb_audio_ring.h's SPSC ring (already using __dmb() for
- * RP2350/Cortex-M33 write-buffer safety, not just same-core ISR-vs-
- * mainloop ordering) is what makes this cross-core split safe: the
- * producer side (usb_audio_ring_push(), called from the USB ISR) still
- * runs on core 0, the consumer side (usb_audio_drain_ring(), called from
+ * blocking call.
+ *
+ * i2s_output.c no longer uses pico_audio_i2s_multi's high-level API at
+ * all (see its own top comment for why -- this device is now clocked
+ * by an external PCM1808 breakout board, not itself), so
+ * give_audio_buffer()'s specific blocking call is gone -- but the two-
+ * core split remains necessary regardless: i2s_output_write_block()
+ * still spin-waits for TX ring space, paced by that external clock, and
+ * core 0 must never be the one blocked on that wait.
+ *
+ * usb_audio_ring.h's SPSC ring (already using __dmb() for RP2350/
+ * Cortex-M33 write-buffer safety, not just same-core ISR-vs-mainloop
+ * ordering) is what makes the cross-core split safe: the producer side
+ * (usb_audio_ring_push(), called from the USB ISR) still runs on core 0,
+ * the consumer side (usb_audio_drain_ring(), called from
  * audio_pipeline_fill_block()) now runs on core 1.
  */
 
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
-#include "pico/audio.h"
 #include "pico/multicore.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
@@ -67,6 +73,37 @@
 #include "fx_phaser.h"
 #include "fx_djfilter.h"
 #include "fx_beatrepeat.h"
+
+// PCM1808 clock settling: both i2s_output.c's TX and i2s_input.c's RX
+// PIO programs sync to the PCM1808's own BCK/LRCLK via a preamble that
+// must catch a clean edge to lock correctly. Calling either init
+// function immediately at boot does not reliably give the PCM1808's own
+// clock generation time to settle after power-on -- confirmed directly:
+// omitting this entirely produced constant, un-self-healing garbage
+// (or, in a later variant, i2s_output_write_block() spinning forever
+// because the TX side never started draining) with no other code change
+// involved. This explicitly initializes both pins as plain GPIO inputs
+// and waits (bounded, so USB-only operation with no PCM1808 connected
+// still works) for LRCLK to actually start toggling, then gives it a
+// further settling margin, before either init function runs and
+// reconfigures these same pins for their own PIO use.
+static void wait_for_pcm1808_clock(void)
+{
+    gpio_init(I2S_BCK_PIN);
+    gpio_set_dir(I2S_BCK_PIN, GPIO_IN);
+    gpio_init(I2S_BCK_PIN + 1u);
+    gpio_set_dir(I2S_BCK_PIN + 1u, GPIO_IN);
+
+    uint32_t start_us = time_us_32();
+    bool last = gpio_get(I2S_BCK_PIN + 1u);
+    while (time_us_32() - start_us < 500000u) {   // 500ms timeout
+        bool cur = gpio_get(I2S_BCK_PIN + 1u);
+        if (cur != last) break;   // LRCLK is toggling
+        last = cur;
+    }
+    sleep_ms(15);   // further settling margin, matching what was observed
+                     // to work in practice
+}
 
 static void core0_init(void)
 {
@@ -92,9 +129,9 @@ static void core0_init(void)
     // would silently retune every PSRAM QMI divisor to a different
     // real-world frequency than the one actually validated on hardware.
     // (This clock gives an exact-integer PIO clock divider for 48kHz-
-    // family rates specifically, but config.h currently runs at 44100Hz
-    // -- see its comment for why that's an approximate, not exact,
-    // divider here, and why that turned out not to matter in practice.)
+    // family rates specifically; config.h currently runs at 96000Hz --
+    // see its comment for why -- which also divides this system clock
+    // exactly.)
     vreg_set_voltage(VREG_VOLTAGE_1_15);
     busy_wait_ms(10);
     if (!set_sys_clock_hz(307200000, false)) {
@@ -126,13 +163,17 @@ static void core0_init(void)
 
     // Bus priority: give DMA precedence over the CPU on shared buses.
     // Carried over unchanged -- matters for this build's own DMA-heavy
-    // paths (I2S input's IRQ-less ring, I2S output's consumer DMA, and
+    // paths (I2S input's IRQ-less ring, I2S output's own TX ring, and
     // every PSRAM-backed FX effect's QMI traffic).
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
 
-    // I2S output before I2S input: the input's receiver PIO program
-    // watches BCK/LRCLK pads that only carry a real clock once the
-    // output side is driving them (see i2s_input.h's top comment).
+    // Both i2s_output.c and i2s_input.c now just watch the PCM1808's
+    // externally-driven BCK/LRCLK as inputs (see i2s_output.h's top
+    // comment) -- order between them no longer matters for clock
+    // generation the way it did when this device generated its own I2S
+    // clock. See wait_for_pcm1808_clock()'s own comment for why it runs
+    // first.
+    wait_for_pcm1808_clock();
     i2s_output_init();
     i2s_input_init();
 
@@ -161,33 +202,21 @@ static void core0_init(void)
              fx_delay_psram_ok() && fx_reverb_psram_ok() && fx_beatrepeat_psram_ok());
 }
 
-// Core 1: the audio processing loop. Blocking give_audio_buffer() is
-// fine here -- see the top-of-file comment for why this can no longer
-// share a core with USB servicing.
+// Core 1: the audio processing loop. Spin-waiting inside
+// i2s_output_write_block() for TX ring space is fine here -- see the
+// top-of-file comment for why this can no longer share a core with USB
+// servicing (that reasoning applied to pico_audio_i2s_multi's hardcoded-
+// blocking give_audio_buffer(); this build no longer uses that API at
+// all -- see i2s_output.h's top comment for why -- but the same
+// principle holds: whatever this core blocks on, it must never be USB
+// servicing).
 static void core1_main(void)
 {
-    audio_buffer_pool_t *out_pool = i2s_output_pool();
+    static int32_t block_buf[AUDIO_BUFFER_SAMPLES * 2];   // interleaved L,R
 
     while (true) {
-        // Blocking take is fine here too (this core has nothing else to
-        // do): normally returns quickly, since the output DMA is
-        // steadily consuming and returning buffers to the free list at
-        // a fixed ~4ms cadence (AUDIO_BUFFER_SAMPLES @ SAMPLE_RATE_HZ).
-        audio_buffer_t *buf = take_audio_buffer(out_pool, true);
-        if (!buf) continue;
-
-        uint32_t frames = buf->max_sample_count;
-        if (frames > AUDIO_BUFFER_SAMPLES) frames = AUDIO_BUFFER_SAMPLES;
-
-        audio_pipeline_fill_block((int32_t *)buf->buffer->bytes, frames, SAMPLE_RATE_HZ);
-        buf->sample_count = frames;
-
-        // Blocks here (i2s_wrap_producer_give(), inside
-        // pico_audio_i2s_multi, waits for a free consumer buffer) --
-        // this is the actual, hardcoded-blocking call this whole
-        // two-core split exists to isolate away from USB servicing. See
-        // this file's top comment.
-        give_audio_buffer(out_pool, buf);
+        audio_pipeline_fill_block(block_buf, AUDIO_BUFFER_SAMPLES, SAMPLE_RATE_HZ);
+        i2s_output_write_block(block_buf, AUDIO_BUFFER_SAMPLES);
     }
 }
 

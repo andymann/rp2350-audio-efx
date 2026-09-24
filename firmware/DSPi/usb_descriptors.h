@@ -19,6 +19,7 @@
 
 #include "tusb.h"
 #include "class/audio/audio.h"
+#include "config.h"   // SAMPLE_RATE_HZ
 
 // ----------------------------------------------------------------------------
 // USB IDs
@@ -39,12 +40,27 @@
 #define AUDIO_OUT_ENDPOINT  0x01U
 #define AUDIO_IN_ENDPOINT   0x82U   // feedback (async iso sync pipe)
 
-// Max iso OUT packet size: stereo, 16-bit, fixed 48kHz, +1 frame of jitter
-// headroom. (48000/1000 + 1) * 2ch * 2B = 196, rounded up to a 4-byte
-// aligned 196 (already aligned). Comfortably under the 1023-byte
-// full-speed isochronous ceiling, and far smaller than the original's
-// 788/582 (which had to size for 8-channel/24-bit/96kHz).
-#define AUDIO_EP_MAX_PKT    196U
+// Max iso OUT packet size: stereo, 16-bit, at this build's actual
+// SAMPLE_RATE_HZ (config.h), +1 frame of jitter headroom for async rate
+// adaptation. Computed from SAMPLE_RATE_HZ rather than a fixed value --
+// a fixed value here previously went stale silently every time
+// SAMPLE_RATE_HZ changed over the course of this project (44.1kHz, then
+// 48kHz, then 96kHz for the PCM1808), since nothing else in the build
+// cross-checks the two. At 96kHz specifically, stereo 16-bit audio needs
+// 384 bytes/ms -- double a value sized for 48kHz -- which silently caps
+// every USB packet at less than half of what a real 96kHz stream needs
+// to fit in it. The visible symptom of that specific mismatch was macOS
+// reporting "no valid formats available" and 0 input/output channels
+// for the whole device, not distorted or truncated audio: a UAC1 format
+// descriptor whose endpoint is too small to physically carry its own
+// advertised rate is internally inconsistent, and macOS correctly
+// refuses the entire format outright rather than trying to stream
+// something impossible. Comfortably under the 1023-byte full-speed
+// isochronous ceiling at every rate this build supports, and far
+// smaller than the original DSPi's own 788/582 (sized for its
+// 8-channel/24-bit/96kHz multichannel support, which this build
+// doesn't have).
+#define AUDIO_EP_MAX_PKT    (((SAMPLE_RATE_HZ + 999u) / 1000u + 1u) * 4u)
 
 // ----------------------------------------------------------------------------
 // INTERFACE NUMBERS

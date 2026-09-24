@@ -1,14 +1,15 @@
 /*
  * audio_pipeline.c - see audio_pipeline.h
  *
- * USB and I2S input are unconditionally summed together (clamped to
- * avoid immediate clipping from the sum) rather than switched between --
- * there's no control surface, vendor protocol, or other mechanism left
- * in this build to select one source over the other, and the request
- * this was built for ("audio input via usb and i2s") reads most
- * naturally as "both should be usable", not "exactly one, switchable".
- * If a source isn't sending anything, it contributes silence to the sum,
- * so this is harmless when only one is actually in use.
+ * Exactly one input source is ever active at a time -- matches the
+ * original DSPi's own single-active-input-source model, not a
+ * simultaneous mix of USB and I2S. Selected via the Set Input Source
+ * command (0x08, fx_control.h); defaults to USB at boot. An earlier
+ * revision of this file unconditionally summed both sources together
+ * (with dynamic per-source gain to avoid ducking a source when the
+ * other was silent) -- reverted in favor of this simpler, original-
+ * firmware-matching model once the request became explicit: a single,
+ * user-selected source, not an automatic mix.
  */
 
 #include "audio_pipeline.h"
@@ -53,31 +54,22 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
     memset(i2s_l, 0, sample_count * sizeof(float));
     memset(i2s_r, 0, sample_count * sizeof(float));
 
-    // Each drains only as many frames as it actually has; the memsets
-    // above leave the rest as silence, so a source that's idle or
-    // slower than sample_count this call just contributes nothing for
-    // those frames rather than stale/garbage data.
+    // Both are drained every block regardless of which is actually
+    // selected -- USB packets and I2S capture both keep arriving
+    // whether or not their source is the active one, and draining
+    // whichever isn't selected here still prevents its own ring from
+    // backing up/overflowing in the meantime, so switching sources
+    // later doesn't start from a backlog of stale data.
     usb_audio_drain_ring(usb_l, usb_r, sample_count);
     i2s_input_poll(i2s_l, i2s_r, sample_count);
 
-    for (uint32_t i = 0; i < sample_count; i++) {
-        // Attenuate by half (-6dB) before summing, not after: if both
-        // sources are simultaneously near full-scale (0dBFS, common for
-        // real digital sources -- USB audio and a hot I2S line both
-        // routinely hit this), a straight sum-then-hard-clamp clips on
-        // nearly every sample, which is audibly harsh, bitcrusher-like
-        // digital distortion, not the occasional overs a limiter would
-        // produce. Halving first means even the worst case (+1.0 and
-        // +1.0) lands exactly at +1.0, needing no clipping at all in
-        // ordinary use -- the safety clamp below exists only for a
-        // source that's already out of [-1, 1] before it reaches here.
-        float l = usb_l[i] * 0.5f + i2s_l[i] * 0.5f;
-        float r = usb_r[i] * 0.5f + i2s_r[i] * 0.5f;
-        if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
-        if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
-        mix_l[i] = l;
-        mix_r[i] = r;
-    }
+    // Exactly one source reaches the mix -- see this file's top comment.
+    const float *src_l = (fx_control_get_input_source() == FX_INPUT_SOURCE_I2S)
+                         ? i2s_l : usb_l;
+    const float *src_r = (fx_control_get_input_source() == FX_INPUT_SOURCE_I2S)
+                         ? i2s_r : usb_r;
+    memcpy(mix_l, src_l, sample_count * sizeof(float));
+    memcpy(mix_r, src_r, sample_count * sizeof(float));
 
     // FX chain, in ascending effect_num order (fx_control.h's slot
     // registry) -- slot 1 (reverb) chained after slot 0 (delay), etc.
