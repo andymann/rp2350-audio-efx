@@ -24,6 +24,7 @@
 #include "fx_djfilter.h"
 #include "fx_beatrepeat.h"
 #include "leveller.h"
+#include "limiter.h"
 
 #include <string.h>
 
@@ -89,6 +90,14 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
     fx_phaser_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
     fx_djfilter_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
     fx_beatrepeat_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
+
+    // Output limiter (limiter.h) -- deliberately the LAST stage, after
+    // the whole FX chain, so it also catches overs the effects themselves
+    // create (feedback, beat-repeat summing, filter resonance). Anything
+    // it lets through is guaranteed <= its ceiling, so the hard clamp in
+    // the conversion below becomes a pure backstop while it's enabled.
+    // Disabled by default; zero-latency bypass when off.
+    limiter_process_block(mix_l, mix_r, sample_count);
 
     // Float [-1, 1] -> 24-bit-in-HIGH-bits signed integer: this build's
     // own i2s_output.c writes samples straight into its TX ring with no

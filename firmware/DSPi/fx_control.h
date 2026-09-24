@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the ten commands below -- it is meant to be dead
+ * and only understands the twelve commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -175,6 +175,40 @@
  *     speed, max_gain, lookahead), matching Query FX/Query BPM's own
  *     "respond with a Set-command-shaped frame" pattern. This command
  *     always succeeds -- there is no invalid form of a 1-byte command.
+ *
+ *   Set Limiter   (0x0B, 5 bytes total):
+ *     0x0B, enabled[0-1], ceiling, release, input_gain
+ *     Configures the output limiter (limiter.h) -- a stereo-linked,
+ *     peak-sensing brickwall limiter with 2ms lookahead, the very last
+ *     stage before the output, after the whole FX chain (so it also
+ *     catches overs produced by feedback/resonant effects, which the
+ *     leveller, running before the FX chain, cannot). Guaranteed never
+ *     to exceed the ceiling (sample peak), with no hard clipping. Adds
+ *     2ms latency while enabled, none while bypassed; enable/disable
+ *     crossfade over one block. Disabled by default. Not affected by
+ *     Disable All (0x06).
+ *       enabled:    0 = bypass, 1 = active.
+ *       ceiling:    0-255, output ceiling in 0.1dB steps below 0dBFS
+ *                   (0 = 0.0dBFS, 10 = -1.0dBFS, 255 = -25.5dBFS).
+ *                   Default 10 (-1.0dBFS).
+ *       release:    0-255, release time = 10 + 4 * value ms (10-1030ms).
+ *                   Default 23 (102ms).
+ *       input_gain: 0-255, drive into the limiter in 0.1dB steps
+ *                   (0 = unity, 60 = +6.0dB, 255 = +25.5dB) -- turns it
+ *                   into a loudness maximiser. Gain changes are smoothed
+ *                   by the limiter's own attack/release, no zipper noise.
+ *                   Default 0.
+ *     A frame with enabled > 1 is dropped: no echo, no state change
+ *     (every other byte is full-range valid). On success, the device
+ *     echoes the exact 5-byte command back.
+ *
+ *   Query Limiter  (0x0C, 1 byte total):
+ *     0x0C
+ *     Responds with the current limiter configuration in the same
+ *     5-byte shape as Set Limiter's own frame, leading byte 0x0C
+ *     (matching Query Leveller's own convention): 0x0C, enabled,
+ *     ceiling, release, input_gain. Values are the exact bytes last
+ *     set, no rescaling round-trip. This command always succeeds.
  *
  * On boot, before any command is processed, the device sends the literal
  * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a

@@ -74,6 +74,7 @@
 #include "fx_djfilter.h"
 #include "fx_beatrepeat.h"
 #include "leveller.h"
+#include "limiter.h"
 
 // PCM1808 clock settling: both i2s_output.c's TX and i2s_input.c's RX
 // PIO programs sync to the PCM1808's own BCK/LRCLK via a preamble that
@@ -197,6 +198,10 @@ static void core0_init(void)
     // since audio_pipeline_fill_block() calls leveller_process_block()
     // from the very first block.
     leveller_init();
+
+    // Output limiter (limiter.h) -- same constraints as leveller_init()
+    // above: no PSRAM, but must run before core 1 launches.
+    limiter_init();
 
     // Onboard LED as a physical PSRAM go/no-go signal: solid on only if
     // every PSRAM-backed FX effect confirmed its allocation is actually

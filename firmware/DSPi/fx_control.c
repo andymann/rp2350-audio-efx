@@ -9,6 +9,7 @@
 
 #include "fx_control.h"
 #include "leveller.h"
+#include "limiter.h"
 #include "config.h"
 
 #include "pico/stdlib.h"
@@ -54,6 +55,8 @@
 #define CMD_SET_INPUT_SRC   0x08u
 #define CMD_SET_LEVELLER    0x09u
 #define CMD_QUERY_LEVELLER  0x0Au
+#define CMD_SET_LIMITER     0x0Bu
+#define CMD_QUERY_LIMITER   0x0Cu
 
 #define SET_FX_LEN          7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
 #define QUERY_FX_LEN        2u   // cmd + effect_num
@@ -67,6 +70,8 @@
 #define SET_INPUT_SRC_LEN   2u   // cmd + source
 #define SET_LEVELLER_LEN    6u   // cmd + enabled + amount + speed + max_gain + lookahead
 #define QUERY_LEVELLER_LEN  1u   // cmd only
+#define SET_LIMITER_LEN     5u   // cmd + enabled + ceiling + release + input_gain
+#define QUERY_LIMITER_LEN   1u   // cmd only
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
 // Boot banner: sent once, unsolicited, right after the port comes up --
@@ -178,6 +183,8 @@ static uint8_t expected_len_for_cmd(uint8_t cmd) {
         case CMD_SET_INPUT_SRC: return SET_INPUT_SRC_LEN;
         case CMD_SET_LEVELLER: return SET_LEVELLER_LEN;
         case CMD_QUERY_LEVELLER: return QUERY_LEVELLER_LEN;
+        case CMD_SET_LIMITER:   return SET_LIMITER_LEN;
+        case CMD_QUERY_LIMITER: return QUERY_LIMITER_LEN;
         default:                return 0;
     }
 }
@@ -328,6 +335,26 @@ static void handle_query_leveller(void) {
     start_tx(resp, SET_LEVELLER_LEN);
 }
 
+// Frame is dropped if enabled > 1 -- same validate-then-drop pattern as
+// Set Leveller. ceiling/release/input_gain are full-range bytes; the
+// limiter stores them raw so Query Limiter round-trips exactly.
+static void handle_set_limiter(const uint8_t *f) {
+    if (f[1] > 1u) return;   // drop, no echo
+    limiter_set_config(f[1] != 0, f[2], f[3], f[4]);
+    start_tx(f, SET_LIMITER_LEN);   // echo the command verbatim
+}
+
+// Always succeeds -- same "Set-shaped response, own cmd byte leading"
+// convention as Query Leveller.
+static void handle_query_limiter(void) {
+    bool enabled;
+    uint8_t resp[SET_LIMITER_LEN];
+    limiter_get_config(&enabled, &resp[2], &resp[3], &resp[4]);
+    resp[0] = CMD_QUERY_LIMITER;
+    resp[1] = enabled ? 1u : 0u;
+    start_tx(resp, SET_LIMITER_LEN);
+}
+
 static void dispatch_frame(void) {
     switch (frame_buf[0]) {
         case CMD_SET_FX:          handle_set_fx(frame_buf);           break;
@@ -340,6 +367,8 @@ static void dispatch_frame(void) {
         case CMD_SET_INPUT_SRC:   handle_set_input_source(frame_buf); break;
         case CMD_SET_LEVELLER:    handle_set_leveller(frame_buf);     break;
         case CMD_QUERY_LEVELLER:  handle_query_leveller();            break;
+        case CMD_SET_LIMITER:     handle_set_limiter(frame_buf);      break;
+        case CMD_QUERY_LIMITER:   handle_query_limiter();             break;
         default: break;   // unreachable: expected_len_for_cmd() already filtered
     }
 }
