@@ -82,16 +82,28 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
     fx_djfilter_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
     fx_beatrepeat_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
 
-    // Float [-1, 1] -> 24-bit-in-low-bits signed integer, the producer
-    // format pico_audio_i2s_multi's audio_i2s_connect_extra() expects
-    // (see i2s_output.h's top comment) -- it left-shifts by 8 to build
-    // the final MSB-aligned 32-bit I2S frame itself.
+    // Float [-1, 1] -> 24-bit-in-HIGH-bits signed integer: this build's
+    // own i2s_output.c writes samples straight into its TX ring with no
+    // further conversion (see i2s_output_write_block()), so the shift
+    // into bits [31:8] that pico_audio_i2s_multi's audio_i2s_connect_extra()
+    // used to apply internally -- back when this build used that
+    // library's high-level API for I2S output -- must happen here now
+    // instead. audio_i2s_dataout_extclk.pio (the PIO program actually
+    // driving the wire now) explicitly documents expecting "24-in-32
+    // alignment" with autopull shifting the MSB out first: without this
+    // shift, the 24-bit magnitude sits in the LOW bits of each 32-bit
+    // word instead, and the PIO's autopull-from-the-top instead sends
+    // mostly sign-extension bits -- audible as a large, uniform level
+    // drop (independent of which input source is selected, since this
+    // conversion runs after the exclusive source selection) rather than
+    // a crash or garbled audio, since the sign bit itself (bit 31) is
+    // still correct either way.
     for (uint32_t i = 0; i < sample_count; i++) {
         float l = mix_l[i] * 8388607.0f;
         float r = mix_r[i] * 8388607.0f;
         if (l > 8388607.0f) l = 8388607.0f; else if (l < -8388608.0f) l = -8388608.0f;
         if (r > 8388607.0f) r = 8388607.0f; else if (r < -8388608.0f) r = -8388608.0f;
-        out_stereo[2 * i]     = (int32_t)l;
-        out_stereo[2 * i + 1] = (int32_t)r;
+        out_stereo[2 * i]     = ((int32_t)l) << 8;
+        out_stereo[2 * i + 1] = ((int32_t)r) << 8;
     }
 }
