@@ -112,7 +112,20 @@ float detect(float peak, uint32_t slot, float ceil, float in_gain, float a_rel)
     float target = in_gain;
     if (peak * in_gain > ceil) target = ceil / peak;
 
-    // 2. Sliding-window minimum over the last W samples.
+    // 2. Sliding-window minimum over the last W samples (positions
+    //    n-B .. n). Expire the front BEFORE pushing: at that point every
+    //    remaining entry lies in n-B .. n-1 (at most B entries), so the
+    //    push brings the deque to at most B+1 == W -- exactly its
+    //    capacity. The first version pushed first and expired after,
+    //    which briefly needed W+1 slots: on any run of more than W
+    //    strictly rising targets (falling peaks above the ceiling --
+    //    every falling edge of loud bass) the push overwrote the front,
+    //    dq_count grew past W, and the indices ran off the end of
+    //    dq_val[]/dq_pos[], corrupting .bss and hanging the device.
+    if (dq_count && (uint32_t)(n - dq_pos[dq_head]) >= W) {
+        if (++dq_head >= W) dq_head = 0;
+        dq_count--;
+    }
     while (dq_count) {
         uint32_t back = dq_head + dq_count - 1u;
         if (back >= W) back -= W;
@@ -124,10 +137,6 @@ float detect(float peak, uint32_t slot, float ceil, float in_gain, float a_rel)
     dq_val[ins] = target;
     dq_pos[ins] = n;
     dq_count++;
-    if ((uint32_t)(n - dq_pos[dq_head]) >= W) {   // front fell out of window
-        if (++dq_head >= W) dq_head = 0;
-        dq_count--;
-    }
     float wmin = dq_val[dq_head];
     n++;
 
