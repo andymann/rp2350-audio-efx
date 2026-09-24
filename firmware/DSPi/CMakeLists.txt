@@ -5,7 +5,7 @@ add_compile_options(-O2)
 
 # Use -O3 for DSP-critical files (the USB/I2S audio path and every FX effect).
 set_source_files_properties(
-    usb_audio.c audio_pipeline.c i2s_input.c i2s_output.c dac_hw_mute.c fx_delay.c tempo_sync.c fx_stutter.c fx_phaser.c fx_djfilter.c fx_beatrepeat.c fx_reverb.c
+    usb_audio.c audio_pipeline.c i2s_input.c i2s_output.c dac_hw_mute.c fx_delay.c tempo_sync.c fx_stutter.c fx_phaser.c fx_djfilter.c fx_beatrepeat.c fx_reverb.c leveller.c
     PROPERTIES COMPILE_FLAGS "-O3"
 )
 
@@ -48,6 +48,8 @@ add_executable(DSPi
     fx_djfilter.h
     fx_beatrepeat.c
     fx_beatrepeat.h
+    leveller.c
+    leveller.h
     flash_clkdiv.c
     flash_clkdiv.h
     i2s_input.c

@@ -73,6 +73,7 @@
 #include "fx_phaser.h"
 #include "fx_djfilter.h"
 #include "fx_beatrepeat.h"
+#include "leveller.h"
 
 // PCM1808 clock settling: both i2s_output.c's TX and i2s_input.c's RX
 // PIO programs sync to the PCM1808's own BCK/LRCLK via a preamble that
@@ -189,6 +190,13 @@ static void core0_init(void)
     fx_phaser_init();
     fx_djfilter_init();
     fx_beatrepeat_init();
+
+    // Volume Leveller (leveller.h) -- no PSRAM use, ordering relative to
+    // the PSRAM-backed effects above doesn't matter, but must run before
+    // core 1 launches (multicore_launch_core1(), this function's caller)
+    // since audio_pipeline_fill_block() calls leveller_process_block()
+    // from the very first block.
+    leveller_init();
 
     // Onboard LED as a physical PSRAM go/no-go signal: solid on only if
     // every PSRAM-backed FX effect confirmed its allocation is actually

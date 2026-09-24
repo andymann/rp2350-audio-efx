@@ -8,6 +8,7 @@
  */
 
 #include "fx_control.h"
+#include "leveller.h"
 #include "config.h"
 
 #include "pico/stdlib.h"
@@ -51,6 +52,8 @@
 #define CMD_DISABLE_ALL     0x06u
 #define CMD_RESTART_CLOCK   0x07u
 #define CMD_SET_INPUT_SRC   0x08u
+#define CMD_SET_LEVELLER    0x09u
+#define CMD_QUERY_LEVELLER  0x0Au
 
 #define SET_FX_LEN          7u   // cmd + effect_num + on_off + p1 + p2 + p3 + drywet
 #define QUERY_FX_LEN        2u   // cmd + effect_num
@@ -62,6 +65,8 @@
 #define DISABLE_ALL_LEN     1u   // cmd only
 #define RESTART_CLOCK_LEN   1u   // cmd only
 #define SET_INPUT_SRC_LEN   2u   // cmd + source
+#define SET_LEVELLER_LEN    6u   // cmd + enabled + amount + speed + max_gain + lookahead
+#define QUERY_LEVELLER_LEN  1u   // cmd only
 #define MAX_FRAME_LEN       8u   // largest of the above, matches the protocol's cap
 
 // Boot banner: sent once, unsolicited, right after the port comes up --
@@ -171,6 +176,8 @@ static uint8_t expected_len_for_cmd(uint8_t cmd) {
         case CMD_DISABLE_ALL:   return DISABLE_ALL_LEN;
         case CMD_RESTART_CLOCK: return RESTART_CLOCK_LEN;
         case CMD_SET_INPUT_SRC: return SET_INPUT_SRC_LEN;
+        case CMD_SET_LEVELLER: return SET_LEVELLER_LEN;
+        case CMD_QUERY_LEVELLER: return QUERY_LEVELLER_LEN;
         default:                return 0;
     }
 }
@@ -281,16 +288,58 @@ static void handle_set_input_source(const uint8_t *f) {
     start_tx(f, SET_INPUT_SRC_LEN);   // echo the command verbatim
 }
 
+// Frame is dropped if enabled > 1, speed > 2, or lookahead > 1 -- matches
+// Set FX's own validate-then-drop pattern. amount/max_gain are full-range
+// bytes (0-255), so every value is valid; leveller_set_config() does its
+// own float-range clamping (leveller.c) as a second line of defense.
+static void handle_set_leveller(const uint8_t *f) {
+    uint8_t enabled   = f[1];
+    uint8_t amount    = f[2];
+    uint8_t speed     = f[3];
+    uint8_t max_gain  = f[4];
+    uint8_t lookahead = f[5];
+    if (enabled > 1u || speed > 2u || lookahead > 1u) return;   // drop, no echo
+
+    leveller_set_config(enabled != 0,
+                        (float)amount * (100.0f / 255.0f),
+                        speed,
+                        (float)max_gain * (35.0f / 255.0f),
+                        lookahead != 0);
+    start_tx(f, SET_LEVELLER_LEN);   // echo the command verbatim
+}
+
+// Always succeeds (no invalid form of a 1-byte command) -- responds with
+// the current Leveller config in the same 6-byte shape as Set Leveller's
+// own frame, matching Query FX/Query BPM's "respond with a Set-command-
+// shaped frame" pattern.
+static void handle_query_leveller(void) {
+    bool enabled, lookahead;
+    float amount, max_gain_db;
+    uint8_t speed;
+    leveller_get_config(&enabled, &amount, &speed, &max_gain_db, &lookahead);
+
+    uint8_t resp[SET_LEVELLER_LEN];
+    resp[0] = CMD_QUERY_LEVELLER;
+    resp[1] = enabled ? 1u : 0u;
+    resp[2] = (uint8_t)(amount * (255.0f / 100.0f) + 0.5f);
+    resp[3] = speed;
+    resp[4] = (uint8_t)(max_gain_db * (255.0f / 35.0f) + 0.5f);
+    resp[5] = lookahead ? 1u : 0u;
+    start_tx(resp, SET_LEVELLER_LEN);
+}
+
 static void dispatch_frame(void) {
     switch (frame_buf[0]) {
-        case CMD_SET_FX:        handle_set_fx(frame_buf);          break;
-        case CMD_QUERY_FX:      handle_query_fx(frame_buf);        break;
-        case CMD_QUERY_FW:      handle_query_fw();                 break;
-        case CMD_SET_BPM:       handle_set_bpm(frame_buf);         break;
-        case CMD_QUERY_BPM:     handle_query_bpm();                break;
-        case CMD_DISABLE_ALL:   handle_disable_all(frame_buf);     break;
-        case CMD_RESTART_CLOCK: handle_restart_clock(frame_buf);   break;
-        case CMD_SET_INPUT_SRC: handle_set_input_source(frame_buf); break;
+        case CMD_SET_FX:          handle_set_fx(frame_buf);           break;
+        case CMD_QUERY_FX:        handle_query_fx(frame_buf);         break;
+        case CMD_QUERY_FW:        handle_query_fw();                  break;
+        case CMD_SET_BPM:         handle_set_bpm(frame_buf);          break;
+        case CMD_QUERY_BPM:       handle_query_bpm();                 break;
+        case CMD_DISABLE_ALL:     handle_disable_all(frame_buf);      break;
+        case CMD_RESTART_CLOCK:   handle_restart_clock(frame_buf);    break;
+        case CMD_SET_INPUT_SRC:   handle_set_input_source(frame_buf); break;
+        case CMD_SET_LEVELLER:    handle_set_leveller(frame_buf);     break;
+        case CMD_QUERY_LEVELLER:  handle_query_leveller();            break;
         default: break;   // unreachable: expected_len_for_cmd() already filtered
     }
 }

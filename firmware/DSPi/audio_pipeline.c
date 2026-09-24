@@ -23,6 +23,7 @@
 #include "fx_phaser.h"
 #include "fx_djfilter.h"
 #include "fx_beatrepeat.h"
+#include "leveller.h"
 
 #include <string.h>
 
@@ -70,6 +71,13 @@ void audio_pipeline_fill_block(int32_t *out_stereo, uint32_t sample_count,
                          ? i2s_r : usb_r;
     memcpy(mix_l, src_l, sample_count * sizeof(float));
     memcpy(mix_r, src_r, sample_count * sizeof(float));
+
+    // Volume Leveller (leveller.h) -- same structural position as the
+    // original DSPi's own PASS 2.5 ("after Master EQ, before crossfeed"):
+    // right after input processing (here, source selection), before the
+    // downstream effects chain. Disabled by default; a no-op bypass when
+    // off (leveller_process_block() returns immediately).
+    leveller_process_block(mix_l, mix_r, sample_count, sample_rate_hz);
 
     // FX chain, in ascending effect_num order (fx_control.h's slot
     // registry) -- slot 1 (reverb) chained after slot 0 (delay), etc.

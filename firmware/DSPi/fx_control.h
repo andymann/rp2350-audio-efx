@@ -7,7 +7,7 @@
  * uart_control.c (which tunnels the full vendor-command surface behind a
  * synced, CRC-checked frame format on a user-configurable UART/pins). This
  * protocol is fixed at 9600 8N1 on fixed pins, has no sync byte and no CRC,
- * and only understands the eight commands below -- it is meant to be dead
+ * and only understands the ten commands below -- it is meant to be dead
  * simple for a small external MCU to bit-bang or talk to from a basic UART
  * peripheral.
  *
@@ -137,6 +137,44 @@
  *     while not selected. Defaults to USB (0x00) at boot. A frame with
  *     source > 1 is dropped: no echo, no state change. On success, the
  *     device echoes the exact 2-byte command back.
+ *
+ *   Set Leveller  (0x09, 6 bytes total):
+ *     0x09, enabled[0-1], amount, speed[0-2], max_gain, lookahead[0-1]
+ *     Configures the Volume Leveller -- a feedforward, stereo-linked,
+ *     single-band RMS upward compressor ported from the original DSPi's
+ *     own Volume Leveller (github.com/WeebLabs/DSPi#volume-leveller):
+ *     quiet content is boosted toward a consistent level while loud
+ *     content passes through untouched, with a soft knee for a smooth,
+ *     artifact-free transition and a -3dBFS gain-reduction safety
+ *     limiter that only engages if boosted content would otherwise
+ *     exceed it. Runs after input source selection, before the FX
+ *     chain -- see leveller.h's top comment for why. Disabled by
+ *     default, matching the original's own factory default.
+ *       enabled:   0 = bypass, 1 = active.
+ *       amount:    0-255, scaled to 0-100% compression strength (1:1
+ *                  ratio at 0%, 20:1 at 100%). Original default 50%
+ *                  (~127).
+ *       speed:     0 = Slow (music/orchestral), 1 = Medium (general
+ *                  purpose), 2 = Fast (speech/dialogue) -- selects
+ *                  attack/release/RMS-window time constants. Original
+ *                  default: Slow (0).
+ *       max_gain:  0-255, scaled to 0-35dB, the ceiling on how much
+ *                  quiet content can be boosted. Original default 15dB
+ *                  (~109).
+ *       lookahead: 0 = off, 1 = on -- 5ms predictive delay for smoother
+ *                  gain transitions on sudden level changes. Original
+ *                  default: on (1).
+ *     A frame with enabled > 1, speed > 2, or lookahead > 1 is dropped:
+ *     no echo, no state change. On success, the device echoes the exact
+ *     6-byte command back.
+ *
+ *   Query Leveller (0x0A, 1 byte total):
+ *     0x0A
+ *     Responds with the current Leveller configuration in the same
+ *     6-byte shape as Set Leveller's own frame (cmd, enabled, amount,
+ *     speed, max_gain, lookahead), matching Query FX/Query BPM's own
+ *     "respond with a Set-command-shaped frame" pattern. This command
+ *     always succeeds -- there is no invalid form of a 1-byte command.
  *
  * On boot, before any command is processed, the device sends the literal
  * ASCII string "Andyland.info" (13 bytes, no framing) unsolicited as a
